@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title MockStaking
-/// @notice Mock of the Bittensor staking precompile (0x805) for testing.
-///         Matches the real IStaking interface: coldkeys are bytes32 (substrate account IDs).
-///
-///         On the real chain, an EVM address (H160) maps to a substrate account via
-///         blake2b("evm:" + h160). In this mock, we simulate the same with
-///         keccak256("evm:", h160) for simplicity (the test helpers use the same hash).
+/// @dev Uses keccak256("evm:", h160) for coldkey derivation instead of the real
+///      blake2b, matching the test helper `_toSubstrate`.
 contract MockStaking {
-    // hotkey => coldkey(bytes32) => netuid => stake
     mapping(bytes32 => mapping(bytes32 => mapping(uint256 => uint256))) public stakes;
     uint256 public moveStakeRoundingLoss;
+    bool public transferStakeReverts;
 
-    /// @notice Test helper: directly set stake for a coldkey.
+    function setTransferStakeReverts(bool v) external {
+        transferStakeReverts = v;
+    }
+
     function setStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid, uint256 amount) external {
         stakes[hotkey][coldkey][netuid] = amount;
     }
 
-    /// @dev Convert msg.sender H160 to substrate-like account ID.
-    ///      Uses keccak256("evm:", addr) to match the test helper _toSubstrate().
-    function _senderColdkey() internal view returns (bytes32) {
+    function _senderColdkey() private view returns (bytes32) {
         return keccak256(abi.encodePacked("evm:", msg.sender));
     }
 
@@ -31,6 +27,9 @@ contract MockStaking {
         uint256 destination_netuid,
         uint256 amount
     ) external payable {
+        if (transferStakeReverts) {
+            revert("MockStaking: transferStake reverted");
+        }
         stakes[hotkey][_senderColdkey()][origin_netuid] -= amount;
         stakes[hotkey][destination_coldkey][destination_netuid] += amount;
     }
@@ -52,5 +51,28 @@ contract MockStaking {
 
     function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid) external view returns (uint256) {
         return stakes[hotkey][coldkey][netuid];
+    }
+
+    uint256 public taoPerAlpha;
+    uint256 public taoPerAlphaDenom;
+    bool public removeStakeReverts;
+
+    function setRemoveStakeRate(uint256 num, uint256 denom) external {
+        taoPerAlpha = num;
+        taoPerAlphaDenom = denom;
+    }
+
+    function setRemoveStakeReverts(bool v) external {
+        removeStakeReverts = v;
+    }
+
+    function removeStake(bytes32 hotkey, uint256 alphaAmount, uint256 netuid) external payable {
+        if (removeStakeReverts) {
+            revert("MockStaking: removeStake reverted");
+        }
+        stakes[hotkey][_senderColdkey()][netuid] -= alphaAmount;
+        uint256 taoOut = (alphaAmount * taoPerAlpha) / taoPerAlphaDenom;
+        (bool ok,) = msg.sender.call{ value: taoOut }("");
+        require(ok, "MockStaking: TAO credit failed");
     }
 }
