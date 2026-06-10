@@ -42,6 +42,15 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     uint256 public constant NETUID1 = 1;
     uint256 public constant NETUID2 = 2;
 
+    uint16 public constant NETUID1_BPS_HK1 = 3334;
+    uint16 public constant NETUID1_BPS_HK2 = 3333;
+    uint16 public constant NETUID1_BPS_HK3 = 3333;
+
+    uint16 public constant NETUID2_BPS_HK2 = 6000;
+    uint16 public constant NETUID2_BPS_HK1 = 4000;
+
+    uint16 public constant BPS_BASE = 10_000;
+
     uint256 public TOKEN1;
     uint256 public TOKEN2;
 
@@ -68,8 +77,10 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         registry = new ValidatorRegistry(address(this), signers, 2);
         vault.setValidatorRegistry(address(registry));
 
-        _setValidators(NETUID1, _hks3(hotkey1, hotkey2, hotkey3), _wts3(3334, 3333, 3333));
-        _setValidators(NETUID2, _hks2(hotkey2, hotkey1), _wts2(6000, 4000));
+        _setValidators(
+            NETUID1, _hotkeys(hotkey1, hotkey2, hotkey3), _weights(NETUID1_BPS_HK1, NETUID1_BPS_HK2, NETUID1_BPS_HK3)
+        );
+        _setValidators(NETUID2, _hotkeys(hotkey2, hotkey1), _weights(NETUID2_BPS_HK2, NETUID2_BPS_HK1));
 
         TOKEN1 = vault.currentTokenId(NETUID1);
         TOKEN2 = vault.currentTokenId(NETUID2);
@@ -79,40 +90,40 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         _submitAttestation(registry, netuid, hks, wts, signerPks);
     }
 
-    function _hks2(bytes32 a, bytes32 b) internal pure returns (bytes32[] memory hks) {
-        hks = new bytes32[](2);
-        hks[0] = a;
-        hks[1] = b;
+    function _hotkeys(bytes32 a) internal pure returns (bytes32[] memory arr) {
+        arr = new bytes32[](1);
+        arr[0] = a;
     }
 
-    function _hks3(bytes32 a, bytes32 b, bytes32 c) internal pure returns (bytes32[] memory hks) {
-        hks = new bytes32[](3);
-        hks[0] = a;
-        hks[1] = b;
-        hks[2] = c;
+    function _hotkeys(bytes32 a, bytes32 b) internal pure returns (bytes32[] memory arr) {
+        arr = new bytes32[](2);
+        arr[0] = a;
+        arr[1] = b;
     }
 
-    function _wts2(uint16 a, uint16 b) internal pure returns (uint16[] memory wts) {
-        wts = new uint16[](2);
-        wts[0] = a;
-        wts[1] = b;
+    function _hotkeys(bytes32 a, bytes32 b, bytes32 c) internal pure returns (bytes32[] memory arr) {
+        arr = new bytes32[](3);
+        arr[0] = a;
+        arr[1] = b;
+        arr[2] = c;
     }
 
-    function _wts3(uint16 a, uint16 b, uint16 c) internal pure returns (uint16[] memory wts) {
-        wts = new uint16[](3);
-        wts[0] = a;
-        wts[1] = b;
-        wts[2] = c;
+    function _weights(uint16 a) internal pure returns (uint16[] memory arr) {
+        arr = new uint16[](1);
+        arr[0] = a;
     }
 
-    function _hks1(bytes32 a) internal pure returns (bytes32[] memory hks) {
-        hks = new bytes32[](1);
-        hks[0] = a;
+    function _weights(uint16 a, uint16 b) internal pure returns (uint16[] memory arr) {
+        arr = new uint16[](2);
+        arr[0] = a;
+        arr[1] = b;
     }
 
-    function _wts1(uint16 a) internal pure returns (uint16[] memory wts) {
-        wts = new uint16[](1);
-        wts[0] = a;
+    function _weights(uint16 a, uint16 b, uint16 c) internal pure returns (uint16[] memory arr) {
+        arr = new uint16[](3);
+        arr[0] = a;
+        arr[1] = b;
+        arr[2] = c;
     }
 
     function _countRebalancedLogs(Vm.Log[] memory logs) internal pure returns (uint256 count) {
@@ -132,7 +143,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     function _simulateAlphaDeposit(address user, uint256 netuid, uint256 amount) internal {
         address cloneAddr = vault.getDepositAddress(user, netuid);
         bytes32 cloneSub = _toSubstrate(cloneAddr);
-        // Use the best validator hotkey for this subnet (matches what processDeposit will resolve)
+        // Use the best validator hotkey for this subnet (matches what wrap will resolve)
         bytes32 hotkey = vault.getBestValidator(netuid);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneSub, netuid, amount);
     }
@@ -143,13 +154,13 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneSub, netuid, amount);
     }
 
-    function _processDeposit(address user, uint256 netuid) internal {
-        _processDepositHotkey(user, netuid, vault.getBestValidator(netuid));
+    function _wrap(address user, uint256 netuid) internal {
+        _wrapHotkey(user, netuid, vault.getBestValidator(netuid));
     }
 
-    function _processDepositHotkey(address user, uint256 netuid, bytes32 chosenHotkey) internal {
+    function _wrapHotkey(address user, uint256 netuid, bytes32 chosenHotkey) internal {
         vm.prank(user);
-        vault.processDeposit(user, netuid, chosenHotkey);
+        vault.wrap(user, netuid, chosenHotkey);
     }
 
     function _getStake(bytes32 hotkey, address who, uint256 netuid) internal view returns (uint256) {
@@ -227,5 +238,9 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         uint256 num = MockStaking(STAKING_PRECOMPILE).taoPerAlpha();
         uint256 denom = MockStaking(STAKING_PRECOMPILE).taoPerAlphaDenom();
         return (alpha * num) / denom;
+    }
+
+    function _weighted(uint256 total, uint16 bps) internal pure returns (uint256) {
+        return (total * bps) / BPS_BASE;
     }
 }
