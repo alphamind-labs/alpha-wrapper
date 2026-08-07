@@ -3,23 +3,36 @@
 Bittensor alpha-token wrapper (ERC-1155 vault + staking precompile integration).
 
 ## Contents
-- `src/AlphaVault.sol` — ERC-1155 vault that wraps staked alpha
-- `src/DepositMailbox.sol` — minimal-proxy mailbox for per-user deposits
-- `src/SubnetClone.sol` — minimal-proxy stake holder for a single subnet
-- `src/ValidatorRegistry.sol` — admin-managed registry of target validator weights per subnet
-- `src/interfaces/` — Bittensor precompile interfaces (IStaking, IMetagraph, IAddressMapping) + IValidatorRegistry
-- `test/` — Foundry tests + mocks for the precompiles
-- `frontend/` — wrap/unwrap dApp (Vite + React)
+- `src/AlphaVault.sol` - ERC-1155 vault that wraps staked alpha
+- `src/DepositMailbox.sol` - minimal-proxy mailbox for per-user deposits
+- `src/SubnetClone.sol` - minimal-proxy stake holder for a single subnet
+- `src/CloneBase.sol` - shared base of both clones: vault-only access, one-shot initialization
+- `src/ValidatorRegistry.sol` - registry of target validator weights per subnet, attested by a threshold of signers whose membership the admin manages
+- `src/interfaces/` - Bittensor precompile interfaces (IStaking, IAlpha, ISubnet, IAddressMapping) + IValidatorRegistry
+- `test/` - Foundry tests + mocks for the precompiles
+
+## Documentation
+
+- [How it works](docs/overview.md) - the mental model: mailboxes, clones,
+  token ids, share price, the validator registry
+- [User guide](docs/user-guide.md) - wrapping, exiting, fixing mistakes
+- [Attester guide](docs/attester-guide.md) - producing and submitting
+  validator-weight attestations
+- [Edge cases](docs/edge-cases.md) - dissolution, disabled transfers, the
+  chain's minimums, stray TAO
+- [Security model](docs/security-model.md) - roles, trust boundaries,
+  safeguards
+
+Tooling docs: [`scripts/README.md`](scripts/README.md) for the on-chain
+observability scripts, [`e2e/README.md`](e2e/README.md) for the end-to-end
+suite.
 
 ## Build
+
+Dependencies are vendored as git submodules:
+
 ```bash
-forge install foundry-rs/forge-std --no-commit
-forge install OpenZeppelin/openzeppelin-contracts --no-commit
+git submodule update --init --recursive
 forge build
 forge test
-```
-
-## Frontend
-```bash
-cd frontend && npm install && npm run dev
 ```

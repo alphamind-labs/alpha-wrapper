@@ -75,7 +75,7 @@ contract ValidatorRegistryTest is AttestationHelper {
 
     /// @dev Sign with each privkey in the order given. Caller is responsible for ordering
     ///      `pks` so recovered addresses ascend; the contract's `_verifySignatures` enforces
-    ///      that. PK address order is PK2 < PK3 < PK1 < PK_UNKNOWN — the `_pksN` helpers
+    ///      that. PK address order is PK2 < PK3 < PK1 < PK_UNKNOWN - the `_pksN` helpers
     ///      below are written with this in mind.
     function _sign(ValidatorRegistry.WeightAttestation memory att, uint256[] memory pks)
         private
@@ -300,8 +300,6 @@ contract ValidatorRegistryTest is AttestationHelper {
     }
 
     function test_SetSigners_NewThresholdStored() public {
-        assertEq(registry.threshold(), 2, "precondition: setUp installs threshold 2");
-
         address d = vm.addr(0xD);
         address e = vm.addr(0xE);
         address f = vm.addr(0xF);
@@ -662,10 +660,8 @@ contract ValidatorRegistryTest is AttestationHelper {
         ns[1] = e;
         registry.setSigners(ns, 2);
 
-        // The first recovered address among the ascending-sorted oldSigs is whichever of
-        // s1/s2 sorts lower; either way the contract's first iteration hits a non-signer.
-        // Selector-only expectRevert keeps the test independent of that ordering.
-        vm.expectRevert();
+        // oldSigs sort ascending to [s2, s1], so the contract recovers s2 first; it is no longer a signer.
+        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.UnknownSigner.selector, s2));
         registry.updateValidators(att, oldSigs);
 
         // State is unchanged after the failed submission.

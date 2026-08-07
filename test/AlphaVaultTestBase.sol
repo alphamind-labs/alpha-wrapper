@@ -6,19 +6,19 @@ import { AlphaVault } from "src/AlphaVault.sol";
 import { DepositMailbox } from "src/DepositMailbox.sol";
 import { SubnetClone } from "src/SubnetClone.sol";
 import { ValidatorRegistry } from "src/ValidatorRegistry.sol";
-import { MockStaking } from "./mocks/MockStaking.sol";
+import { MockStaking, CHAIN_MIN_STAKE, CHAIN_MIN_TRANSFER, CHAIN_NOMINATOR_MIN_STAKE } from "./mocks/MockStaking.sol";
 import { MockAddressMapping } from "./mocks/MockAddressMapping.sol";
-import { MockStorageQuery } from "./mocks/MockStorageQuery.sol";
+import { MockSubnetPrecompile } from "./mocks/MockSubnetPrecompile.sol";
+import { MockAlpha } from "./mocks/MockAlpha.sol";
 import { AttestationHelper } from "./helpers/AttestationHelper.sol";
 import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
 import { ADDRESS_MAPPING_PRECOMPILE } from "src/interfaces/IAddressMapping.sol";
-
-address constant STORAGE_QUERY = 0x0000000000000000000000000000000000000807;
+import { ALPHA_PRECOMPILE } from "src/interfaces/IAlpha.sol";
+import { SUBNET_PRECOMPILE } from "src/interfaces/ISubnet.sol";
 
 abstract contract AlphaVaultTestBase is AttestationHelper {
     event SubnetProxyCreated(uint256 indexed tokenId, address clone);
     event Rebalanced(uint256 indexed tokenId, bytes32 indexed fromHotkey, bytes32 indexed toHotkey, uint256 amount);
-    event MinRebalanceAmtUpdated(uint256 oldValue, uint256 newValue);
     event Deposited(address indexed user, uint256 indexed tokenId, uint256 assets, uint256 shares);
 
     AlphaVault public vault;
@@ -26,7 +26,6 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     SubnetClone public subnetLogic;
     ValidatorRegistry public registry;
 
-    address public owner = address(this);
     address public alice = makeAddr("alice");
     address public bob = makeAddr("bob");
 
@@ -38,6 +37,8 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     uint256 internal constant SIGNER_PK_1 = 0xA11CE;
     uint256 internal constant SIGNER_PK_2 = 0xB0B;
     uint256[] internal signerPks;
+
+    string internal constant VAULT_URI = "https://api.tao20.io/{id}.json";
 
     uint256 public constant NETUID1 = 1;
     uint256 public constant NETUID2 = 2;
@@ -51,21 +52,31 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
 
     uint16 public constant BPS_BASE = 10_000;
 
+    // The simulated chain's dust threshold; aliased so the two can never drift.
+    uint256 internal constant DUST_THRESHOLD = CHAIN_NOMINATOR_MIN_STAKE;
+
     uint256 public TOKEN1;
     uint256 public TOKEN2;
 
     function setUp() public virtual {
         vm.etch(STAKING_PRECOMPILE, address(new MockStaking()).code);
         vm.etch(ADDRESS_MAPPING_PRECOMPILE, address(new MockAddressMapping()).code);
-        vm.etch(STORAGE_QUERY, address(new MockStorageQuery()).code);
-        MockStorageQuery(STORAGE_QUERY).setRegisteredAt(uint16(NETUID1), 100);
-        MockStorageQuery(STORAGE_QUERY).setRegisteredAt(uint16(NETUID2), 200);
+        vm.etch(SUBNET_PRECOMPILE, address(new MockSubnetPrecompile()).code);
+        vm.etch(ALPHA_PRECOMPILE, address(new MockAlpha()).code);
+        MockSubnetPrecompile(SUBNET_PRECOMPILE).setRegisteredAt(uint16(NETUID1), 100);
+        MockSubnetPrecompile(SUBNET_PRECOMPILE).setRegisteredAt(uint16(NETUID2), 200);
         // Pre-fund so the staking precompile mock can credit native TAO back to callers.
         vm.deal(STAKING_PRECOMPILE, 1_000_000 ether);
+        // etch copies code, not storage, so the sell rate starts 0/0 and any un-parameterized sell
+        // panics on division; a 1:1 default keeps unrelated tests meaningful. The min-stake floor
+        // and the dust-sweep threshold are seeded to the chain's live values for the same reason.
+        MockStaking(STAKING_PRECOMPILE).setRemoveStakeRate(1, 1);
+        MockStaking(STAKING_PRECOMPILE).setChainMinStake(CHAIN_MIN_STAKE);
+        MockStaking(STAKING_PRECOMPILE).setChainMinTransfer(CHAIN_MIN_TRANSFER);
+        MockStaking(STAKING_PRECOMPILE).setNominatorMinRequiredStake(DUST_THRESHOLD);
 
         mailboxLogic = new DepositMailbox();
         subnetLogic = new SubnetClone();
-        vault = new AlphaVault("https://api.tao20.io/{id}.json", address(mailboxLogic), address(subnetLogic));
 
         // vm.addr(SIGNER_PK_2) < vm.addr(SIGNER_PK_1); the registry requires sigs sorted
         // ascending by recovered address, so attestations sign in this order.
@@ -75,7 +86,9 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         signers[0] = vm.addr(signerPks[0]);
         signers[1] = vm.addr(signerPks[1]);
         registry = new ValidatorRegistry(address(this), signers, 2);
-        vault.setValidatorRegistry(address(registry));
+
+        // validatorRegistry is immutable, so it must exist before the vault is constructed.
+        vault = _deployVault(address(registry));
 
         _setValidators(
             NETUID1, _hotkeys(hotkey1, hotkey2, hotkey3), _weights(NETUID1_BPS_HK1, NETUID1_BPS_HK2, NETUID1_BPS_HK3)
@@ -84,6 +97,12 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
 
         TOKEN1 = vault.currentTokenId(NETUID1);
         TOKEN2 = vault.currentTokenId(NETUID2);
+    }
+
+    /// @dev `validatorRegistry` is immutable, so tests that need a different registry construct a
+    ///      fresh vault against it rather than swapping it on the shared `vault`.
+    function _deployVault(address _registry) internal returns (AlphaVault) {
+        return new AlphaVault(VAULT_URI, address(mailboxLogic), address(subnetLogic), _registry);
     }
 
     function _setValidators(uint256 netuid, bytes32[] memory hks, uint16[] memory wts) internal {
@@ -142,29 +161,38 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
 
     function _simulateAlphaDeposit(address user, uint256 netuid, uint256 amount) internal {
         address cloneAddr = vault.getDepositAddress(user, netuid);
-        bytes32 cloneSub = _toSubstrate(cloneAddr);
+        bytes32 cloneColdkey = _toSubstrate(cloneAddr);
         // Use the best validator hotkey for this subnet (matches what wrap will resolve)
-        bytes32 hotkey = vault.getBestValidator(netuid);
-        MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneSub, netuid, amount);
+        bytes32 hotkey = vault.getCurrentValidators(netuid)[0];
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneColdkey, netuid, amount);
     }
 
     function _simulateAlphaDepositHotkey(address user, uint256 netuid, uint256 amount, bytes32 hotkey) internal {
         address cloneAddr = vault.getDepositAddress(user, netuid);
-        bytes32 cloneSub = _toSubstrate(cloneAddr);
-        MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneSub, netuid, amount);
+        bytes32 cloneColdkey = _toSubstrate(cloneAddr);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneColdkey, netuid, amount);
+    }
+
+    function _simulateEmissions(uint256 netuid, uint256 extraAlpha) internal {
+        uint256 currentStake = _getVaultStake(hotkey1, netuid);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, _subnetColdkey(netuid), netuid, currentStake + extraAlpha);
     }
 
     function _wrap(address user, uint256 netuid) internal {
-        _wrapHotkey(user, netuid, vault.getBestValidator(netuid));
+        _wrapHotkey(user, netuid, vault.getCurrentValidators(netuid)[0]);
     }
 
     function _wrapHotkey(address user, uint256 netuid, bytes32 chosenHotkey) internal {
         vm.prank(user);
-        vault.wrap(user, netuid, chosenHotkey);
+        vault.wrap(netuid, chosenHotkey);
     }
 
     function _getStake(bytes32 hotkey, address who, uint256 netuid) internal view returns (uint256) {
         return MockStaking(STAKING_PRECOMPILE).getStake(hotkey, _toSubstrate(who), netuid);
+    }
+
+    function _getStakeForColdkey(bytes32 hotkey, bytes32 coldkey, uint256 netuid) internal view returns (uint256) {
+        return MockStaking(STAKING_PRECOMPILE).getStake(hotkey, coldkey, netuid);
     }
 
     function _subnetColdkey(uint256 netuid) internal view returns (bytes32) {
@@ -175,6 +203,29 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         return MockStaking(STAKING_PRECOMPILE).getStake(hotkey, _subnetColdkey(netuid), netuid);
     }
 
+    function _setVaultStake(bytes32 hotkey, uint256 netuid, uint256 amount) internal {
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey, _subnetColdkey(netuid), netuid, amount);
+    }
+
+    function _setVaultStakes(uint256 netuid, uint256 a, uint256 b, uint256 c) internal returns (uint256 total) {
+        bytes32 cloneColdkey = _subnetColdkey(netuid);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, cloneColdkey, netuid, a);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey2, cloneColdkey, netuid, b);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey3, cloneColdkey, netuid, c);
+        total = a + b + c;
+    }
+
+    // Smallest share count whose pro-rata assets equal `targetAssets` under the share-price cushion.
+    function _sharesForExactAssets(uint256 tokenId, uint256 targetAssets, uint256 totalAlpha)
+        internal
+        view
+        returns (uint256 shares)
+    {
+        uint256 scaledSupply = vault.totalSupply(tokenId) + 1e9;
+        shares = (targetAssets * scaledSupply + totalAlpha) / (totalAlpha + 1);
+        require((shares * (totalAlpha + 1)) / scaledSupply == targetAssets, "no share count hits target assets");
+    }
+
     function _totalVaultStakeAcrossHotkeys(uint256 netuid) internal view returns (uint256) {
         uint256 total;
         total += _getVaultStake(hotkey1, netuid);
@@ -183,8 +234,28 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         return total;
     }
 
+    function _userStakeAcrossHotkeys(bytes32 coldkey, uint256 netuid) internal view returns (uint256 total) {
+        total += _getStakeForColdkey(hotkey1, coldkey, netuid);
+        total += _getStakeForColdkey(hotkey2, coldkey, netuid);
+        total += _getStakeForColdkey(hotkey3, coldkey, netuid);
+        total += _getStakeForColdkey(hotkey4, coldkey, netuid);
+    }
+
+    function _userStakeAcrossHotkeys(address user, uint256 netuid) internal view returns (uint256) {
+        return _userStakeAcrossHotkeys(_toSubstrate(user), netuid);
+    }
+
     function _setRegBlock(uint256 netuid, uint64 blockNum) internal {
-        MockStorageQuery(STORAGE_QUERY).setRegisteredAt(uint16(netuid), blockNum);
+        MockSubnetPrecompile(SUBNET_PRECOMPILE).setRegisteredAt(uint16(netuid), blockNum);
+    }
+
+    function _setDissolving(uint256 netuid, bool value) internal {
+        MockSubnetPrecompile(SUBNET_PRECOMPILE).setDissolving(uint16(netuid), value);
+    }
+
+    function _registerSubnet(uint256 netuid, bytes32 hotkey) internal {
+        _setValidators(netuid, _hotkeys(hotkey), _weights(10_000));
+        _setRegBlock(netuid, 300);
     }
 
     function _simulateTaoAwardedOnDissolution(uint256 tokenId, uint256 taoAmount) internal {
@@ -201,8 +272,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
 
     function _simulateDissolutionCompleted(uint256 netuid) internal {
         _setRegBlock(netuid, 0);
-        uint16[] memory empty = new uint16[](0);
-        MockStorageQuery(STORAGE_QUERY).setDissolvedNetworks(empty);
+        _setDissolving(netuid, false);
     }
 
     function _simulateNewNetworkRegistered(uint256 tokenId, uint64 newRegBlock, uint256 taoInClone) internal {
@@ -210,20 +280,54 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         _setRegBlock(tokenId & 0xFFFF, newRegBlock);
     }
 
-    function _simulateDissolutionStarted(uint256 tokenId, uint64 newRegBlock) internal {
-        uint256 netuid = tokenId & 0xFFFF;
-        _setRegBlock(netuid, newRegBlock);
-        uint16[] memory queue = new uint16[](1);
-        queue[0] = uint16(netuid);
-        MockStorageQuery(STORAGE_QUERY).setDissolvedNetworks(queue);
+    /// @dev Dissolve leaves the registration block untouched; subtensor removes it only
+    ///      partway through the asynchronous cleanup.
+    function _simulateDissolutionStarted(uint256 netuid) internal {
+        _setDissolving(netuid, true);
+    }
+
+    function _setAlphaPrice(uint256 netuid, uint256 alphaPriceE18) internal {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        MockAlpha(ALPHA_PRECOMPILE).setAlphaPrice(uint16(netuid), alphaPriceE18);
+    }
+
+    function _alphaPriceRead(uint256 netuid) internal view returns (uint256) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return MockAlpha(ALPHA_PRECOMPILE).getAlphaPrice(uint16(netuid));
+    }
+
+    function _setAlphaPriceReadsZero(uint256 netuid) internal {
+        // A sub-quantum chain price rounds to 0 at the EVM boundary while the chain floor still
+        // binds at full precision - the real shape of a sub-1e-9 subnet.
+        _setAlphaPrice(netuid, 0.5e9);
     }
 
     function _setRemoveStakeRate(uint256 num, uint256 denom) internal {
         MockStaking(STAKING_PRECOMPILE).setRemoveStakeRate(num, denom);
     }
 
+    /// @dev Caps what one sell can swap; the rest of the request stays staked.
+    function _setRemoveStakeCap(uint256 maxAlpha) internal {
+        MockStaking(STAKING_PRECOMPILE).setRemoveStakeCap(maxAlpha);
+    }
+
+    /// @dev Zero disables the chain's force-sweep of a sub-threshold remainder.
+    function _setDustThreshold(uint256 thresholdTao) internal {
+        MockStaking(STAKING_PRECOMPILE).setNominatorMinRequiredStake(thresholdTao);
+    }
+
+    function _depositAndWrap(address user, uint256 netuid, uint256 amount) internal returns (uint256 shares) {
+        _simulateAlphaDeposit(user, netuid, amount);
+        _wrap(user, netuid);
+        shares = vault.balanceOf(user, vault.currentTokenId(netuid));
+    }
+
     function _setRemoveStakeReverts(bool v) internal {
         MockStaking(STAKING_PRECOMPILE).setRemoveStakeReverts(v);
+    }
+
+    function _setRemoveStakeRevertsFor(bytes32 hotkey, bool v) internal {
+        MockStaking(STAKING_PRECOMPILE).setRemoveStakeRevertsFor(hotkey, v);
     }
 
     function _simulateTransferToggleOn() internal {
@@ -232,6 +336,23 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
 
     function _donateToClone(address clone, uint256 amount) internal {
         vm.deal(clone, clone.balance + amount);
+    }
+
+    // The claimable-TAO quote is a commitment: a nonzero quote pays exactly, a zero quote means
+    // the claim reverts.
+    function _claimQuotedAmount(address user, uint256 tokenId) internal returns (uint256 delivered) {
+        uint256 quoted = vault.claimableTaoOf(user, tokenId);
+        if (quoted == 0) {
+            vm.expectRevert();
+            vm.prank(user);
+            vault.claimTao(tokenId, payable(user));
+            return 0;
+        }
+        uint256 balanceBefore = user.balance;
+        vm.prank(user);
+        vault.claimTao(tokenId, payable(user));
+        delivered = user.balance - balanceBefore;
+        assertEq(delivered, quoted);
     }
 
     function _expectedTaoFor(uint256 alpha) internal view returns (uint256) {

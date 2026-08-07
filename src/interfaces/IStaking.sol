@@ -26,6 +26,15 @@ interface IStaking {
     function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid) external view returns (uint256);
 
     function removeStake(bytes32 hotkey, uint256 amount, uint256 netuid) external payable;
+
+    /// @notice Tao-denominated dust threshold: after a partial unstake, the chain force-clears any
+    ///         nominator stake entry left below this spot value.
+    function getNominatorMinRequiredStake() external view returns (uint256);
+
+    /// @notice Tao-denominated minimum the chain applies to a partial unstake; a runtime constant,
+    ///         so it moves only on a chain upgrade. The chain floors transfers and same-subnet moves
+    ///         lower and exposes no getter for that one, so this is a safe upper bound for them too.
+    function getDefaultMinStake() external view returns (uint256);
 }
 
 /// @dev Staking precompile address on Bittensor EVM.
