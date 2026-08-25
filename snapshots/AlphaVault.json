@@ -1,9 +1,16 @@
 {
-  "rebalance: after registry weight update": "126431",
-  "unwrap: full": "154571",
-  "unwrap: partial": "198414",
-  "unwrapForTao: partial tail above floor": "183263",
-  "unwrapForTao: sub-floor tail refunded": "160960",
-  "wrap: first": "495823",
-  "wrap: subsequent": "268544"
+  "rebalance: after registry weight update": "135619",
+  "rebalance: fully rotated (64 validators)": "6800621",
+  "unwrap: full": "164380",
+  "unwrap: full (64 validators)": "1493860",
+  "unwrap: partial": "208175",
+  "unwrap: partial (64 validators)": "2992156",
+  "unwrapForTao: full (64 validators)": "1874341",
+  "unwrapForTao: fully rotated (128 slots)": "2565045",
+  "unwrapForTao: partial tail above floor": "191071",
+  "unwrapForTao: sub-floor tail refunded": "167968",
+  "wrap: first": "522733",
+  "wrap: first (64 validators)": "6282734",
+  "wrap: subsequent": "277742",
+  "wrap: subsequent (64 validators)": "4101608"
 }

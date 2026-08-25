@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import { Vm } from "forge-std/Test.sol";
 import { AlphaVault } from "src/AlphaVault.sol";
+import { AlphaVaultLens } from "src/AlphaVaultLens.sol";
 import { DepositMailbox } from "src/DepositMailbox.sol";
 import { SubnetClone } from "src/SubnetClone.sol";
 import { ValidatorRegistry } from "src/ValidatorRegistry.sol";
@@ -22,6 +23,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     event Deposited(address indexed user, uint256 indexed tokenId, uint256 assets, uint256 shares);
 
     AlphaVault public vault;
+    AlphaVaultLens public lens;
     DepositMailbox public mailboxLogic;
     SubnetClone public subnetLogic;
     ValidatorRegistry public registry;
@@ -88,7 +90,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         registry = new ValidatorRegistry(address(this), signers, 2);
 
         // validatorRegistry is immutable, so it must exist before the vault is constructed.
-        vault = _deployVault(address(registry));
+        (vault, lens) = _deployVaultAndLens(address(registry));
 
         _setValidators(
             NETUID1, _hotkeys(hotkey1, hotkey2, hotkey3), _weights(NETUID1_BPS_HK1, NETUID1_BPS_HK2, NETUID1_BPS_HK3)
@@ -100,9 +102,12 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     }
 
     /// @dev `validatorRegistry` is immutable, so tests that need a different registry construct a
-    ///      fresh vault against it rather than swapping it on the shared `vault`.
-    function _deployVault(address _registry) internal returns (AlphaVault) {
-        return new AlphaVault(VAULT_URI, address(mailboxLogic), address(subnetLogic), _registry);
+    ///      fresh vault against it rather than swapping it on the shared `vault`. The lens comes
+    ///      with it: reading a fresh vault's quotes off the shared lens is the mismatched pair the
+    ///      user guide warns integrators about.
+    function _deployVaultAndLens(address _registry) internal returns (AlphaVault freshVault, AlphaVaultLens freshLens) {
+        freshVault = new AlphaVault(VAULT_URI, address(mailboxLogic), address(subnetLogic), _registry);
+        freshLens = new AlphaVaultLens(freshVault);
     }
 
     function _setValidators(uint256 netuid, bytes32[] memory hks, uint16[] memory wts) internal {
@@ -145,6 +150,35 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         arr[2] = c;
     }
 
+    /// @dev The salted hotkeys are disjoint from the named `hotkey1..4` fixtures, so a wide set and
+    ///      the fixture set never collide.
+    function _setValidatorCount(uint256 netuid, uint256 count) internal returns (bytes32[] memory hks) {
+        hks = _hotkeysFrom("validator", count);
+        _setValidators(netuid, hks, _evenWeights(count));
+    }
+
+    function _stakeAcross(bytes32[] memory hks, bytes32 coldkey, uint256 netuid) internal view returns (uint256 total) {
+        for (uint256 i; i < hks.length; ++i) {
+            total += _getStakeForColdkey(hks[i], coldkey, netuid);
+        }
+    }
+
+    function _vaultStakeAcross(bytes32[] memory hks, uint256 netuid) internal view returns (uint256) {
+        return _stakeAcross(hks, _subnetColdkey(netuid), netuid);
+    }
+
+    /// @dev Asserts the vault's stake on `hks` follows the even split, with the rounding remainder
+    ///      on the last slot - the same way the vault assigns targets.
+    function _assertEvenSpread(bytes32[] memory hks, uint256 netuid, uint256 total) internal view {
+        uint16[] memory wts = _evenWeights(hks.length);
+        uint256 assigned;
+        for (uint256 i; i + 1 < hks.length; ++i) {
+            assertEq(_getVaultStake(hks[i], netuid), _weighted(total, wts[i]), "slot off its weight");
+            assigned += _weighted(total, wts[i]);
+        }
+        assertEq(_getVaultStake(hks[hks.length - 1], netuid), total - assigned, "last slot absorbs the remainder");
+    }
+
     function _countRebalancedLogs(Vm.Log[] memory logs) internal pure returns (uint256 count) {
         bytes32 sig = keccak256("Rebalanced(uint256,bytes32,bytes32,uint256)");
         for (uint256 i; i < logs.length;) {
@@ -163,7 +197,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
         address cloneAddr = vault.getDepositAddress(user, netuid);
         bytes32 cloneColdkey = _toSubstrate(cloneAddr);
         // Use the best validator hotkey for this subnet (matches what wrap will resolve)
-        bytes32 hotkey = vault.getCurrentValidators(netuid)[0];
+        bytes32 hotkey = lens.getCurrentValidators(netuid)[0];
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey, cloneColdkey, netuid, amount);
     }
 
@@ -179,7 +213,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     }
 
     function _wrap(address user, uint256 netuid) internal {
-        _wrapHotkey(user, netuid, vault.getCurrentValidators(netuid)[0]);
+        _wrapHotkey(user, netuid, lens.getCurrentValidators(netuid)[0]);
     }
 
     function _wrapHotkey(address user, uint256 netuid, bytes32 chosenHotkey) internal {
@@ -341,7 +375,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper {
     // The claimable-TAO quote is a commitment: a nonzero quote pays exactly, a zero quote means
     // the claim reverts.
     function _claimQuotedAmount(address user, uint256 tokenId) internal returns (uint256 delivered) {
-        uint256 quoted = vault.claimableTaoOf(user, tokenId);
+        uint256 quoted = lens.claimableTaoOf(user, tokenId);
         if (quoted == 0) {
             vm.expectRevert();
             vm.prank(user);

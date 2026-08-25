@@ -40,6 +40,17 @@ over several sales.
 - The performance of the attested validators: emissions accrue, or do
   not, according to where the registry points the stake.
 - The registry quorum and its admin key, within the boundary above.
+- Whoever told them which lens to read, and which build of it. Quotes come
+  from a separate read-only contract that names its vault through `vault()`
+  while the vault names no lens in return. The pairing check catches a
+  mismatched lens and stops there: any contract can answer `vault()`
+  correctly and still invent every quote, and a lens compiled from changed
+  shared-library source answers for the same vault while computing
+  differently. The lens itself can move no stake and mint no shares, so a
+  person reading a number off the wrong one is misinformed. A contract that
+  sizes a slippage bound from a quote can be walked into a bad fill, which
+  is why an integrator pins a reviewed lens address and its runtime code
+  instead of accepting one at call time.
 
 ## Design safeguards
 
@@ -69,3 +80,7 @@ over several sales.
 - A partial `unwrapForTao` can fill short and refund the unsold part as
   shares instead of reverting; callers bound the damage with
   `minTaoOut`.
+- A quorum-signed attestation stays submittable until one lands for its
+  subnet, so a list the signers have moved away from can still be
+  installed by anyone holding its signatures. Landing a replacement is
+  what retires it.
