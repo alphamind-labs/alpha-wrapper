@@ -10,8 +10,9 @@ Subtensor dissolves subnets asynchronously. Chain-side cleanup burns the
 subnet's alpha, converts the pool to TAO and refunds holders pro-rata,
 the vault's clone included.
 
-While cleanup runs the vault freezes every share-priced operation on
-that netuid; the calls revert with `SubnetInDissolutionBlackoutPeriod`.
+While cleanup runs the vault freezes every operation priced on the
+dissolving generation; the calls revert with
+`SubnetInDissolutionBlackoutPeriod`.
 Pricing mid-refund would distribute an incomplete amount.
 
 Once cleanup completes the position is permanently dissolved: the
@@ -23,11 +24,14 @@ refund sits on the clone: until it arrives - or while all of the clone's
 TAO is reserved for claims - `unwrap` reverts `NothingToUnwrap` and
 `previewUnwrap` reverts `SubnetDissolved`. `claimTao` works throughout.
 
-The blackout is scoped by netuid because the chain reports dissolution
-by netuid alone. An old, already-dissolved
-position on a reused netuid is therefore also frozen while its successor
-dissolves, and resumes when that cleanup completes. This is a deliberate
-availability tradeoff.
+The chain reports dissolution by netuid alone. An old, already-dissolved
+position on a reused netuid keeps paying its refund while its successor
+dissolves: the successor's cleanup drains only the successor's clone. The
+one exception is the late window of that cleanup, once the registration
+block already reads zero. There the vault cannot tell the successor's
+cleanup from the old position's own, so the old position waits until it
+completes. Calls that price the live generation stay frozen for the
+whole blackout.
 
 A dissolution refund can also land on your deposit mailbox if stake was
 still parked there; `reclaimTaoFromMailbox(netuid)` recovers it.
@@ -39,7 +43,9 @@ alpha exit and `reclaimAlphaFromMailbox` all transfer stake between
 coldkeys, so all three revert on such a subnet, with shares and mailbox
 balances intact. The TAO paths (`unwrapForTao`,
 `reclaimMailboxAlphaAsTao`) unstake rather than transfer and keep
-working.
+working. This is the situation `unwrapForTao` exists for: it is the
+emergency exit, priced opt-in because its sells move the subnet's pool
+against the holders who stay (see the user guide's exiting section).
 
 ## The chain's minimum stake size
 
@@ -115,8 +121,9 @@ Whatever is still missing at the deadline is written off by a further
 on backing as a side effect. The token then reopens valued at what it can
 find, and the loss falls across everyone holding shares at that moment. Alpha found afterwards is new backing for
 whoever holds shares then. Both halves of that are deliberate - the
-alternative is a token that stays shut indefinitely. The full account is
-in [design/backing-resolution.md](design/backing-resolution.md).
+alternative is a token that stays shut indefinitely. The resulting
+late-recovery attack is documented in the
+[security model](security-model.md#recovery-window-tradeoff-and-late-recovery-attack).
 
 ## A hotkey nobody owns
 
@@ -127,8 +134,21 @@ stake operation naming that key, so the alpha cannot move.
 
 Taking ownership of an abandoned hotkey is open to anyone, costs nothing
 beyond the transaction fee, and gives the claimant no claim on the stake
-delegated under it. Once someone claims it, exits go through again. The
-vault never owns a hotkey itself.
+delegated under it. A watcher calls `try_associate_hotkey`; it does not
+re-register the key on the subnet. Association recreates the owner record
+that stake operations require, and exits go through again.
+
+From EVM tooling, first verify that the neuron-info precompile's
+`getHotkeyOwner(bytes32)` reader at `0x0805` reports no owner, then call
+`tryAssociateHotkey(bytes32)` through the neuron precompile at `0x0804`.
+Those calls are the EVM route to the same check and association; they do
+not grant the watcher control of the vault's coldkey or delegated stake.
+
+The first claimant does control later swaps of that hotkey and can strand it
+again, so this is an operational recovery rather than a permanent protocol
+repair. A watcher should retain the claiming key and keep monitoring the slot
+until holders have exited or the backing has moved to a stable key. The vault
+never owns a hotkey itself.
 
 ## Stray TAO
 
