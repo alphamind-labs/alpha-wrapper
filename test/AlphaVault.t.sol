@@ -11,8 +11,10 @@ import {
     InsufficientShares,
     NetuidOutOfRange,
     NoSharesOutstanding,
+    NothingToUnwrap,
     NoValidatorFound,
     SubnetDissolved,
+    SlippageExceeded,
     SubnetInDissolutionBlackoutPeriod,
     SubnetNotRegistered,
     ValidatorSetMalformed,
@@ -25,7 +27,6 @@ import {
 import { CloneBase } from "src/CloneBase.sol";
 import { DepositMailbox } from "src/DepositMailbox.sol";
 import { SubnetClone } from "src/SubnetClone.sol";
-import { ValidatorRegistry } from "src/ValidatorRegistry.sol";
 import { CHAIN_MIN_STAKE, MockStaking } from "./mocks/MockStaking.sol";
 import { MockValidatorRegistry } from "./mocks/MockValidatorRegistry.sol";
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
@@ -131,7 +132,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
     function test_RevertWhen_WrapZero() public {
         vm.prank(alice);
         vm.expectRevert(ZeroAmount.selector);
-        vault.wrap(NETUID1, hotkey1);
+        vault.wrap(NETUID1, hotkey1, 0);
     }
 
     // ------------------ Share Price ------------------------------------------
@@ -245,6 +246,20 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         vm.prank(alice);
         vm.expectRevert(ZeroAmount.selector);
         vault.unwrap(TOKEN1, 0, aliceSub);
+    }
+
+    function test_RevertWhen_LiveUnwrapToZeroColdkey() public {
+        _simulateAlphaDeposit(alice, NETUID1, 10 ether);
+        _wrap(alice, NETUID1);
+        uint256 shares = vault.balanceOf(alice, TOKEN1);
+        uint256 backing = lens.totalStake(TOKEN1);
+
+        vm.prank(alice);
+        vm.expectRevert(ZeroColdkey.selector);
+        vault.unwrap(TOKEN1, shares, bytes32(0));
+
+        assertEq(vault.balanceOf(alice, TOKEN1), shares, "zero destination burned shares");
+        assertEq(lens.totalStake(TOKEN1), backing, "zero destination moved backing");
     }
 
     // ------------------ Mailbox Security -------------------------------------
@@ -563,10 +578,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
     }
 
     function test_RevertWhen_RegistryWhenNoValidatorsSet() public {
-        address[] memory s = new address[](2);
-        s[0] = vm.addr(SIGNER_PK_1);
-        s[1] = vm.addr(SIGNER_PK_2);
-        (, AlphaVaultLens freshLens) = _deployVaultAndLens(address(new ValidatorRegistry(address(this), s, 2)));
+        (, AlphaVaultLens freshLens) = _deployVaultAndLens(address(new MockValidatorRegistry()));
 
         vm.expectRevert(NoValidatorFound.selector);
         freshLens.getCurrentValidators(NETUID1);
@@ -811,7 +823,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
 
         vm.prank(alice);
         vm.expectRevert(ChosenHotkeyNotInSet.selector);
-        vault.wrap(NETUID1, hotkey4);
+        vault.wrap(NETUID1, hotkey4, 0);
 
         bytes32 aliceSub = _toSubstrate(alice);
         vm.prank(alice);
@@ -942,7 +954,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
     function test_RevertWhen_WrapSubnetNotRegistered() public {
         vm.prank(alice);
         vm.expectRevert(SubnetNotRegistered.selector);
-        vault.wrap(42, hotkey1);
+        vault.wrap(42, hotkey1, 0);
     }
 
     function test_WrapAfterRecycleDeploysNewCloneAndIsolatesOldShares() public {
@@ -1076,21 +1088,51 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         assertEq(alice.balance - before, 50 ether);
     }
 
-    /// @dev The freeze is per netuid: an old tokenId stays frozen while a newer subnet on the
-    ///      same netuid is dissolving.
-    function test_RevertWhen_UnwrapDuringSuccessorBlackoutRegardlessOfForceSendDust() public {
-        _simulateAlphaDeposit(alice, NETUID1, 10 ether);
-        _wrap(alice, NETUID1);
-        uint256 tokenId = vault.currentTokenId(NETUID1);
-        uint256 shares = vault.balanceOf(alice, tokenId);
-
-        _setRegBlock(NETUID1, 500);
+    /// @dev A replaced generation's refund sits on its own clone, which the successor's cleanup
+    ///      never touches, so the old position keeps paying while the successor dissolves.
+    function test_Unwrap_ReplacedGenerationPaysDuringSuccessorBlackout() public {
+        uint256 shares = _depositAndWrap(alice, NETUID1, 10 ether);
+        _simulateNewNetworkRegistered(TOKEN1, 500, 5 ether);
         _simulateDissolutionStarted(NETUID1);
-        vm.deal(vault.subnetClone(tokenId), 1);
+
+        uint256 aliceBefore = alice.balance;
+        vm.prank(alice);
+        vault.unwrap(TOKEN1, shares, _toSubstrate(alice));
+        assertEq(alice.balance - aliceBefore, 5 ether);
+    }
+
+    /// @dev Once the successor's cleanup has cleared the registration block, a replaced position
+    ///      reads the same as one whose own refund is still landing, so it waits with it.
+    function test_RevertWhen_UnwrapDuringSuccessorLateBlackout() public {
+        uint256 shares = _depositAndWrap(alice, NETUID1, 10 ether);
+        _simulateNewNetworkRegistered(TOKEN1, 500, 5 ether);
+        _simulateDissolutionStarted(NETUID1);
+        _setRegBlock(NETUID1, 0);
 
         vm.prank(alice);
         vm.expectRevert(SubnetInDissolutionBlackoutPeriod.selector);
-        vault.unwrap(tokenId, shares, _toSubstrate(alice));
+        vault.unwrap(TOKEN1, shares, _toSubstrate(alice));
+    }
+
+    /// @dev The TAO rail and the value quotes answer a replaced token with its permanent state
+    ///      through a successor's blackout, never with the transient one.
+    function test_RevertWhen_UnwrapForTaoOnReplacedGenerationDuringSuccessorBlackout() public {
+        uint256 shares = _depositAndWrap(alice, NETUID1, 10 ether);
+        _simulateNewNetworkRegistered(TOKEN1, 500, 5 ether);
+        _simulateDissolutionStarted(NETUID1);
+
+        vm.prank(alice);
+        vm.expectRevert(NothingToUnwrap.selector);
+        vault.unwrapForTao(TOKEN1, shares, 0);
+    }
+
+    function test_RevertWhen_SharePriceOnReplacedGenerationDuringSuccessorBlackout() public {
+        _depositAndWrap(alice, NETUID1, 10 ether);
+        _simulateNewNetworkRegistered(TOKEN1, 500, 5 ether);
+        _simulateDissolutionStarted(NETUID1);
+
+        vm.expectRevert(SubnetDissolved.selector);
+        lens.sharePrice(TOKEN1);
     }
 
     function test_UnwrapSucceedsAfterCleanupCompletesAfterForceSend() public {
@@ -1114,27 +1156,13 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         assertEq(alice.balance - aliceBefore, 5 ether + 1);
     }
 
-    function test_RevertWhen_UnwrapDuringSuccessorBlackout() public {
-        _simulateAlphaDeposit(alice, NETUID1, 10 ether);
-        _wrap(alice, NETUID1);
-        uint256 tokenId = vault.currentTokenId(NETUID1);
-        uint256 shares = vault.balanceOf(alice, tokenId);
-
-        _setRegBlock(NETUID1, 500);
-        _simulateDissolutionStarted(NETUID1);
-
-        vm.prank(alice);
-        vm.expectRevert(SubnetInDissolutionBlackoutPeriod.selector);
-        vault.unwrap(tokenId, shares, _toSubstrate(alice));
-    }
-
     function test_RevertWhen_WrapDuringBlackout() public {
         _simulateAlphaDeposit(alice, NETUID1, 10 ether);
         _simulateDissolutionStarted(NETUID1);
 
         vm.prank(alice);
         vm.expectRevert(SubnetInDissolutionBlackoutPeriod.selector);
-        vault.wrap(NETUID1, hotkey1);
+        vault.wrap(NETUID1, hotkey1, 0);
     }
 
     function test_RevertWhen_UnwrapDuringEarlyBlackout() public {
@@ -1218,7 +1246,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
 
         vm.prank(alice);
         vm.expectRevert(SubnetNotRegistered.selector);
-        vault.wrap(NETUID1, hotkey1);
+        vault.wrap(NETUID1, hotkey1, 0);
     }
 
     function test_RevertWhen_RebalanceDuringLateBlackout() public {
@@ -1249,32 +1277,14 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         assertEq(tao, 40 ether);
     }
 
-    function test_RevertWhen_PreviewUnwrapDuringSuccessorBlackout() public {
-        _simulateAlphaDeposit(alice, NETUID1, 10 ether);
-        _wrap(alice, NETUID1);
-        uint256 tokenId = vault.currentTokenId(NETUID1);
-        uint256 shares = vault.balanceOf(alice, tokenId);
-
-        _setRegBlock(NETUID1, 500);
+    function test_PreviewUnwrap_QuotesReplacedGenerationDuringSuccessorBlackout() public {
+        uint256 shares = _depositAndWrap(alice, NETUID1, 10 ether);
+        _simulateNewNetworkRegistered(TOKEN1, 500, 40 ether);
         _simulateDissolutionStarted(NETUID1);
-        _simulateTaoAwardedOnDissolution(tokenId, 40 ether);
 
-        vm.expectRevert(SubnetInDissolutionBlackoutPeriod.selector);
-        lens.previewUnwrap(tokenId, shares);
-    }
-
-    function test_RevertWhen_PreviewUnwrapDuringSuccessorBlackoutRegardlessOfForceSendDust() public {
-        _simulateAlphaDeposit(alice, NETUID1, 10 ether);
-        _wrap(alice, NETUID1);
-        uint256 tokenId = vault.currentTokenId(NETUID1);
-        uint256 shares = vault.balanceOf(alice, tokenId);
-
-        _setRegBlock(NETUID1, 500);
-        _simulateDissolutionStarted(NETUID1);
-        vm.deal(vault.subnetClone(tokenId), 1);
-
-        vm.expectRevert(SubnetInDissolutionBlackoutPeriod.selector);
-        lens.previewUnwrap(tokenId, shares);
+        (uint256 alpha, uint256 tao) = lens.previewUnwrap(TOKEN1, shares);
+        assertEq(alpha, 0);
+        assertEq(tao, 40 ether);
     }
 
     function test_PreviewUnwrapUnknownTokenId() public view {
@@ -1680,7 +1690,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         _simulateAlphaDepositHotkey(alice, NETUID1, 30 ether, hotkey4);
         vm.prank(alice);
         vm.expectRevert(ChosenHotkeyNotInSet.selector);
-        vault.wrap(NETUID1, hotkey4);
+        vault.wrap(NETUID1, hotkey4, 0);
     }
 
     function test_WrapCount1ChosenIsValidatorNoMoves() public {
@@ -1697,7 +1707,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
     function test_RevertWhen_WrapZeroChosenHotkey() public {
         vm.prank(alice);
         vm.expectRevert(ZeroHotkey.selector);
-        vault.wrap(NETUID1, bytes32(0));
+        vault.wrap(NETUID1, bytes32(0), 0);
     }
 
     function test_RevertWhen_WrapWhenDepositBelowMinStake() public {
@@ -1705,7 +1715,7 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         _simulateAlphaDepositHotkey(alice, NETUID1, 1_999_999, hotkey1);
         vm.prank(alice);
         vm.expectRevert(DepositTooSmall.selector);
-        vault.wrap(NETUID1, hotkey1);
+        vault.wrap(NETUID1, hotkey1, 0);
     }
 
     function test_WrapAcceptsExactlyMinStakeCount1() public {
@@ -1721,7 +1731,89 @@ contract AlphaVaultTest is AlphaVaultTestBase {
         _simulateAlphaDepositHotkey(alice, NETUID1, 10 ether, hotkey1);
         vm.prank(alice);
         vm.expectRevert(ZeroAmount.selector);
-        vault.wrap(NETUID1, hotkey2);
+        vault.wrap(NETUID1, hotkey2, 0);
+    }
+
+    // ------------------ Wrap slippage guard ----------------------------------
+
+    function test_WrapMintsExactlyTheQuotedShares() public {
+        _simulateAlphaDepositHotkey(alice, NETUID1, 30 ether, hotkey1);
+        uint256 quoted = lens.previewWrap(TOKEN1, 30 ether);
+
+        vm.prank(alice);
+        vault.wrap(NETUID1, hotkey1, quoted);
+
+        assertEq(vault.balanceOf(alice, TOKEN1), quoted, "the quote is a bound the vault can be held to");
+    }
+
+    function test_RevertWhen_WrapMintsBelowMinSharesOut() public {
+        _simulateAlphaDepositHotkey(alice, NETUID1, 30 ether, hotkey1);
+        uint256 quoted = lens.previewWrap(TOKEN1, 30 ether);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SlippageExceeded.selector, quoted));
+        vault.wrap(NETUID1, hotkey1, quoted + 1);
+    }
+
+    // The deposit is flushed into the position before the mint is priced, so a refused wrap has to
+    // put it back rather than strand it under the vault's coldkey.
+    function test_WrapRefusedOnSlippageLeavesTheDepositInTheMailbox() public {
+        _simulateAlphaDepositHotkey(alice, NETUID1, 30 ether, hotkey1);
+        bytes32 mailboxColdkey = _toSubstrate(vault.getDepositAddress(alice, NETUID1));
+        uint256 quoted = lens.previewWrap(TOKEN1, 30 ether);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SlippageExceeded.selector, quoted));
+        vault.wrap(NETUID1, hotkey1, quoted + 1);
+
+        assertEq(_getStakeForColdkey(hotkey1, mailboxColdkey, NETUID1), 30 ether, "deposit still the caller's");
+        assertEq(_totalVaultStakeAcrossHotkeys(NETUID1), 0, "no alpha landed in the position");
+
+        _wrapHotkey(alice, NETUID1, hotkey1);
+        assertEq(vault.balanceOf(alice, TOKEN1), quoted, "the retry mints what the bound refused");
+    }
+
+    // The exposure the bound exists for: a depositor quotes a rate, the position appreciates before
+    // their call lands, and the same alpha buys fewer shares.
+    function test_RevertWhen_BackingGrowsBetweenQuoteAndWrap() public {
+        _depositAndWrap(alice, NETUID1, 30 ether);
+        _simulateAlphaDepositHotkey(bob, NETUID1, 30 ether, hotkey1);
+        uint256 quoted = lens.previewWrap(TOKEN1, 30 ether);
+
+        _simulateEmissions(NETUID1, 30 ether);
+
+        uint256 requoted = lens.previewWrap(TOKEN1, 30 ether);
+        assertLt(requoted, quoted, "the appreciation moved the rate against the depositor");
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(SlippageExceeded.selector, requoted));
+        vault.wrap(NETUID1, hotkey1, quoted);
+    }
+
+    function testFuzz_WrapMintsAtLeastMinSharesOut(uint256 depositAlpha, uint256 boundBps) public {
+        depositAlpha = bound(depositAlpha, CHAIN_MIN_STAKE, 1_000 ether);
+        boundBps = bound(boundBps, 0, 10_000);
+        _simulateAlphaDepositHotkey(alice, NETUID1, depositAlpha, hotkey1);
+        uint256 quoted = lens.previewWrap(TOKEN1, depositAlpha);
+        uint256 minSharesOut = (quoted * boundBps) / 10_000;
+
+        vm.prank(alice);
+        vault.wrap(NETUID1, hotkey1, minSharesOut);
+
+        assertGe(vault.balanceOf(alice, TOKEN1), minSharesOut, "a bound at or below the quote is honored");
+    }
+
+    function testFuzz_RevertWhen_MinSharesOutExceedsTheQuote(uint256 depositAlpha, uint256 excess) public {
+        depositAlpha = bound(depositAlpha, CHAIN_MIN_STAKE, 1_000 ether);
+        _simulateAlphaDepositHotkey(alice, NETUID1, depositAlpha, hotkey1);
+        uint256 quoted = lens.previewWrap(TOKEN1, depositAlpha);
+        excess = bound(excess, 1, type(uint256).max - quoted);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SlippageExceeded.selector, quoted));
+        vault.wrap(NETUID1, hotkey1, quoted + excess);
+
+        assertEq(vault.balanceOf(alice, TOKEN1), 0, "a refused wrap mints nothing");
     }
 
     function test_WrapDerivesMailboxColdkeyFromUserClone() public {

@@ -213,7 +213,12 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
     ///         produces a movable residual.
     ///         Reverts `SubnetInDissolutionBlackoutPeriod` while a dissolving subnet still has a
     ///         registration block, then `SubnetNotRegistered` once cleanup has removed it.
-    function wrap(uint256 netuid, bytes32 chosenHotkey) external nonReentrant {
+    ///         `minSharesOut` bounds the mint against rate movement between quote and execution,
+    ///         and is sized from the lens `previewWrap`, which prices the same backing.
+    /// @param  netuid       Subnet the deposit sits on.
+    /// @param  chosenHotkey Attested validator hotkey the mailbox balance is staked under.
+    /// @param  minSharesOut Slippage floor; revert if fewer shares would mint.
+    function wrap(uint256 netuid, bytes32 chosenHotkey, uint256 minSharesOut) external nonReentrant {
         if (chosenHotkey == bytes32(0)) revert ZeroHotkey();
 
         uint256 tokenId = currentTokenId(netuid);
@@ -260,6 +265,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
         uint256 preStake = totalAlpha > totalDeposit ? totalAlpha - totalDeposit : 0;
         uint256 shares = VaultMath.sharesFor(preStake, totalSupply(tokenId), totalDeposit);
         if (shares == 0) revert ZeroAmount();
+        if (shares < minSharesOut) revert SlippageExceeded(shares);
         // Recapitalizing a swept position multiplies supply toward the bound; retiring the swept
         // shares through the zero-backing unwrap resets supply and lifts it.
         if (totalSupply(tokenId) + shares > SUPPLY_CAP) revert SupplyCapExceeded();
@@ -273,8 +279,10 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
 
     /// @notice Burn shares and pay out the underlying position.
     /// @dev    Reverts `SubnetInDissolutionBlackoutPeriod` while subtensor's asynchronous
-    ///         cleanup of the netuid is in progress (alpha and TAO refunds are in flux),
-    ///         then dispatches on subnet state:
+    ///         cleanup of the netuid is in progress (alpha and TAO refunds are in flux). A
+    ///         position a later subnet has already replaced keeps paying through that subnet's
+    ///         cleanup, except in its late window once the registration block reads zero.
+    ///         Then dispatches on subnet state:
     ///           - permanently dissolved (tokenId's registrationBlock no longer current): pays pro-rata
     ///             native TAO from the clone's refund balance.
     ///           - live: consolidates the position onto one hotkey and delivers the full pro-rata
@@ -285,6 +293,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
     ///             chain's floor, `GatherBelowFloor` when the gather's largest slot provably cannot
     ///             clear it, and `ConsolidationBelowFloor` when pending rotated-out stake cannot be
     ///             consolidated above it; such positions exit via `unwrapForTao`.
+    ///             Reverts `ZeroColdkey` when the live-path destination is the zero Substrate account.
     ///             Reverts `BackingShortfall` while the position holds backing it cannot account
     ///             for; `syncBacking` reopens the token by booking the loss.
     /// @param  tokenId              ERC1155 tokenId identifying the (netuid, registrationBlock) position.
@@ -294,18 +303,27 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
         if (shares == 0) revert ZeroAmount();
         if (balanceOf(msg.sender, tokenId) < shares) revert InsufficientShares();
         uint16 netuid = VaultMath.netuidOf(tokenId);
-        VaultReads.requireNotDissolving(netuid);
+        VaultReads.requireNotHeldByDissolution(tokenId);
         address clone = subnetClone[tokenId];
 
         if (VaultReads.isIssuedForDissolvedSubnet(tokenId)) {
             _unwrapFromDissolvedSubnet(tokenId, shares, clone);
         } else {
+            if (userSubstrateColdkey == bytes32(0)) revert ZeroColdkey();
             _unwrapFromLiveSubnet(tokenId, shares, userSubstrateColdkey, clone, netuid);
         }
     }
 
     /// @notice Burn vault shares pro-rata and pay the caller native TAO from selling the backing alpha.
-    /// @dev    Full-balance sells go straight to the chain - full drains are exempt from its
+    /// @dev    Opt-in risk exit - prefer `unwrap` wherever the chain still moves stake.
+    ///         This rail liquidates the backing through the subnet's constant-product AMM, and the
+    ///         two sell rounds move that pool's price permanently. The proceeds go to the caller
+    ///         (`minTaoOut` included), but the depressed price stays with the holders who remain:
+    ///         an on-chain sell here taxes the stayers, never the withdrawer. `unwrap` pays the same
+    ///         shares out as staked alpha with no pool interaction at all, so use this rail only
+    ///         when `unwrap` is unavailable (subnet owner disabled alpha transfers) or the floor
+    ///         makes `unwrap` refuse.
+    ///         Full-balance sells go straight to the chain - full drains are exempt from its
     ///         minimum - and their failures bubble.
     ///         A full burn claims the exact backing, so every slot drains fully and nothing is
     ///         withheld - the only exit for a sub-floor position. On a partial burn the remainder
@@ -327,7 +345,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
         if (balanceOf(msg.sender, tokenId) < shares) revert InsufficientShares();
         address clone = subnetClone[tokenId];
         uint16 netuid = VaultMath.netuidOf(tokenId);
-        VaultReads.requireNotDissolving(netuid);
+        VaultReads.requireNotHeldByDissolution(tokenId);
 
         if (VaultReads.isIssuedForDissolvedSubnet(tokenId)) revert NothingToUnwrap();
 
@@ -948,9 +966,9 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
     // -------------------- Backing record ----------------------------------------
 
     /// @notice Move alpha of the vault's own back under the key of the slot it makes whole.
-    /// @dev    Safe to leave permissionless: only the subnet clone can stake under its own
-    ///         coldkey, so a balance found there is already holders' backing, and moving it
-    ///         between the clone's keys can only bring it into view.
+    /// @dev    Safe to leave permissionless: only the subnet clone can move stake held under its
+    ///         coldkey. Third parties can transfer stake in, but moving any balance found there
+    ///         between the clone's keys can only bring it into view as holders' backing.
     ///         The chain moves stake entries whole - a swap migrates the full balance, the dust
     ///         sweep removes an entire entry - so a slot's loss sits under exactly one key. The
     ///         vault aims the find at the short slot with the largest expectation it covers; a
@@ -966,7 +984,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
         address clone = subnetClone[tokenId];
         if (clone == address(0)) revert NothingToUnwrap();
         uint16 netuid = VaultMath.netuidOf(tokenId);
-        VaultReads.requireNotDissolving(netuid);
+        VaultReads.requireNotHeldByDissolution(tokenId);
 
         bytes32 coldkey = VaultReads.coldkeyOf(clone);
         VaultReads.Slot[] memory slots = _slots[tokenId];
@@ -1029,7 +1047,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard {
         address clone = subnetClone[tokenId];
         if (clone == address(0)) revert NothingToUnwrap();
         uint16 netuid = VaultMath.netuidOf(tokenId);
-        VaultReads.requireNotDissolving(netuid);
+        VaultReads.requireNotHeldByDissolution(tokenId);
         if (VaultReads.isIssuedForDissolvedSubnet(tokenId)) revert BackingUnchanged();
 
         bytes32 coldkey = VaultReads.coldkeyOf(clone);

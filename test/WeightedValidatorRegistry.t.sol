@@ -2,9 +2,9 @@
 pragma solidity ^0.8.20;
 
 import { Test, Vm } from "forge-std/Test.sol";
-import { ValidatorRegistry, MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { ValidatorRegistry, MAX_VALIDATORS } from "src/WeightedValidatorRegistry.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
-import { AttestationHelper } from "./helpers/AttestationHelper.sol";
+import { AttestationHelper } from "./helpers/WeightedAttestationHelper.sol";
 
 contract ValidatorRegistryTest is AttestationHelper {
     event SignersUpdated(address[] newSigners, uint8 newThreshold);

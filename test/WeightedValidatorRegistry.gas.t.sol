@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import { ValidatorRegistry, MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
-import { AttestationHelper } from "./helpers/AttestationHelper.sol";
+import { ValidatorRegistry, MAX_VALIDATORS } from "src/WeightedValidatorRegistry.sol";
+import { AttestationHelper } from "./helpers/WeightedAttestationHelper.sol";
 
 /// forge-config: default.isolate = true
 contract ValidatorRegistryGasTest is AttestationHelper {

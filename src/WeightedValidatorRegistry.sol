@@ -4,14 +4,12 @@ pragma solidity ^0.8.20;
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import { IValidatorRegistry } from "./interfaces/IValidatorRegistry.sol";
+import { IValidatorRegistry, MAX_VALIDATORS } from "./interfaces/IValidatorRegistry.sol";
 
 /// @dev The vault reads one stake balance per validator on every state-mutating call, and a
 ///      rotation settles every slot, so per-call work scales with this cap. 64 keeps the widest
 ///      measured path under a tenth of the block gas limit, so a position stays exitable at any
 ///      width the registry can commit.
-uint256 constant MAX_VALIDATORS = 64;
-
 /// @title ValidatorRegistry
 /// @notice Per-subnet validator hotkeys + BPS weights, updated by threshold-of-N
 ///         off-chain attesters via EIP-712 signed payloads.

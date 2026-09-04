@@ -29,10 +29,9 @@ and then telling the vault to collect it. The mailbox is what makes a
 deposit attributable: the vault only ever credits you for stake sitting in
 your own mailbox.
 
-`ValidatorRegistry` says which validators the vault should stake under,
-per subnet, and in what proportions. Its entries are set by a threshold of
-off-chain signers (see [attester-guide.md](attester-guide.md)), and the
-vault takes its validator sets from the registry alone.
+`FixedValidator` says which validator the vault should stake under: one
+immutable hotkey, pinned at deployment, at full weight for every subnet.
+The vault takes its validator set from that contract alone.
 
 ## Token ids
 
@@ -49,8 +48,10 @@ The first `wrap` on a subnet deploys the clone and opens the position;
 
 ## Share price
 
-Shares are priced by the ratio of staked alpha to share supply. The lens
-call `sharePrice(tokenId)` returns alpha per share, scaled by 1e18. Staking
+Shares are priced by the ratio of staked alpha to share supply, with the
+same virtual offsets every rail applies. The lens call `sharePrice(tokenId)`
+returns alpha per share, scaled by 1e18, matching what a live unwrap of one
+share unit pays. Staking
 emissions accrue to the clone's stake, so the price rises over time and
 later depositors mint fewer shares per alpha. The price counts staked
 alpha only; native TAO sitting on the clone is owed to specific holders
@@ -80,7 +81,8 @@ the chain sweeps small stake entries without recording why - neither
 involves a vault call. The vault follows the chain's own successor edge one
 hop, which resolves the ordinary swap unaided; anything deeper shuts the
 token for a recovery window fixed at deployment, in which anyone may point
-the vault back at the alpha. Whatever is still missing at the deadline is written off
-across the holders of the moment. The details are in
-[design/backing-resolution.md](design/backing-resolution.md), and what it
-means for a holder is in [edge-cases.md](edge-cases.md).
+the vault back at the alpha. Whatever is still missing at the deadline is
+written off across the holders of the moment. The operational behavior is in
+[edge-cases.md](edge-cases.md#a-validator-swaps-its-hotkey); the late-recovery
+ownership and adversarial ordering are in
+[security-model.md](security-model.md#recovery-window-tradeoff-and-late-recovery-attack).

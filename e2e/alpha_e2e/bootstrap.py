@@ -276,7 +276,7 @@ def _deploy_contracts(netuids: List[int], hotkey_pubkeys: List[str]):
     # DEPLOYER (0x7bD3...) < WRAPPER_USER (0xd103...) hex-ascending -- required by
     # ValidatorRegistry's sorted-signers check.
     validator_registry_address = chain.forge_create(
-        "src/ValidatorRegistry.sol:ValidatorRegistry",
+        "src/WeightedValidatorRegistry.sol:ValidatorRegistry",
         private_key=config.DEPLOYER_PRIVATE_KEY,
         constructor_args=[
             config.DEPLOYER_ADDRESS,
