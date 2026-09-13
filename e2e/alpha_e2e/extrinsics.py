@@ -7,6 +7,7 @@ error (e.g. its name), which negative tests assert on.
 The bittensor SDK is imported lazily so the pure-Python helpers in this
 package stay usable without it installed.
 """
+import hashlib
 import time
 from contextlib import contextmanager
 
@@ -57,14 +58,13 @@ def _submit(client, call, signer_uri: str = "//Alice") -> str:
 
 
 def _sudo(client, call):
-    """Wrap `call` in root origin. The inner call is encoded against the runtime
-    first, because sudo carries an encoded call rather than a builder."""
+    """Encode an administrative call for submission through Sudo."""
     return _sdk().calls.Sudo.sudo(call=client.compose(call))
 
 
 def transfer_stake(
     dest_ss58: str, hotkey_ss58: str, netuid: int, alpha_amount: int,
-    *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+    *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
     with _connect(chain_endpoint) as client:
         return _submit(client, _sdk().calls.SubtensorModule.transfer_stake(
@@ -73,17 +73,17 @@ def transfer_stake(
             origin_netuid=netuid,
             destination_netuid=netuid,
             alpha_amount=alpha_amount,
-        ))
+        ), signer_uri=signer_uri)
 
 
 def add_stake(
     hotkey_ss58: str, netuid: int, amount_rao: int,
-    *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+    *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
     with _connect(chain_endpoint) as client:
         return _submit(client, _sdk().calls.SubtensorModule.add_stake(
             hotkey=hotkey_ss58, netuid=netuid, amount_staked=amount_rao,
-        ))
+        ), signer_uri=signer_uri)
 
 
 def remove_stake(
@@ -99,26 +99,103 @@ def remove_stake(
 
 def lock_stake(
     hotkey_ss58: str, netuid: int, amount_rao: int,
-    *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+    *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
     """Lock `amount_rao` alpha to the given conviction hotkey."""
     with _connect(chain_endpoint) as client:
         return _submit(client, _sdk().calls.SubtensorModule.lock_stake(
             hotkey=hotkey_ss58, netuid=netuid, amount=amount_rao,
+        ), signer_uri=signer_uri)
+
+
+def set_reject_locked_alpha(
+    enabled: bool, *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Flip whether the signer's coldkey refuses incoming locked alpha; the chain
+    default refuses, and only the account itself or a coldkey swap into it can change that."""
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.set_reject_locked_alpha(
+            enabled=enabled,
+        ), signer_uri=signer_uri)
+
+
+def set_perpetual_lock(
+    netuid: int, enabled: bool, *, signer_uri: str = "//Alice",
+    chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Keep the signer's lock on `netuid` from decaying. Allowed before any lock exists,
+    so a coldkey swap can carry the preference onto its destination."""
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.set_perpetual_lock(
+            netuid=netuid, enabled=enabled,
+        ), signer_uri=signer_uri)
+
+
+def account_flags(coldkey_ss58: str, *, chain_endpoint: str = config.CHAIN_ENDPOINT) -> int:
+    """The chain's per-coldkey flag word; bit 0 set means the account accepts locked alpha."""
+    with _connect(chain_endpoint) as client:
+        value = client.query(_sdk().storage.SubtensorModule.AccountFlags, [coldkey_ss58])
+    return int(value) if value is not None else 0
+
+
+def coldkey_swap_announcement_delay(*, chain_endpoint: str = config.CHAIN_ENDPOINT) -> int:
+    with _connect(chain_endpoint) as client:
+        return int(client.query(_sdk().storage.SubtensorModule.ColdkeySwapAnnouncementDelay))
+
+
+def set_coldkey_swap_announcement_delay(
+    blocks: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Shorten the wait between announcing a coldkey swap and executing it, via Sudo."""
+    with _connect(chain_endpoint) as client:
+        block_hash = _submit(client, _sudo(
+            client,
+            _sdk().calls.AdminUtils.sudo_set_coldkey_swap_announcement_delay(duration=blocks),
         ))
+        current = client.query(_sdk().storage.SubtensorModule.ColdkeySwapAnnouncementDelay)
+    if int(current) != blocks:
+        raise ExtrinsicError(
+            f"set_coldkey_swap_announcement_delay did not reach {blocks} (now {current})"
+        )
+    return block_hash
+
+
+def announce_coldkey_swap(
+    new_coldkey_account: bytes, *, signer_uri: str, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Announce that the signer's coldkey will become `new_coldkey_account`. The chain takes
+    the destination's BlakeTwo256 hash and asks nothing of the destination itself; it only
+    has to stake nothing and not be a hotkey when the swap executes."""
+    new_coldkey_hash = hashlib.blake2b(new_coldkey_account, digest_size=32).hexdigest()
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.announce_coldkey_swap(
+            new_coldkey_hash="0x" + new_coldkey_hash,
+        ), signer_uri=signer_uri)
+
+
+def swap_coldkey_announced(
+    new_coldkey_ss58: str, *, signer_uri: str, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Execute an announced coldkey swap once its delay has passed: every stake, lock,
+    flag and TAO balance of the signer's coldkey moves onto `new_coldkey_ss58`."""
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.swap_coldkey_announced(
+            new_coldkey=new_coldkey_ss58,
+        ), signer_uri=signer_uri)
 
 
 def burned_register(
-    hotkey_ss58: str, netuid: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+    hotkey_ss58: str, netuid: int, *, signer_uri: str = "//Alice",
+    chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
-    """Register a hotkey on a subnet, paying the recycle cost from Alice's balance.
+    """Register a hotkey on a subnet, paying the recycle cost from its owner's balance.
 
     Submitted as a plain call rather than through btcli, which requires this one
     to be MEV-shielded -- machinery the localnet does not run."""
     with _connect(chain_endpoint) as client:
         return _submit(client, _sdk().calls.SubtensorModule.burned_register(
             netuid=netuid, hotkey=hotkey_ss58,
-        ))
+        ), signer_uri=signer_uri)
 
 
 def get_lock(
@@ -161,10 +238,7 @@ def toggle_transfer(
 def set_admin_freeze_window(
     window: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
-    """Set the global admin freeze window via Sudo. On the fast-runtime localnet
-    the window equals the tempo, so owner/root hyperparameter writes are only
-    accepted near each subnet epoch boundary and otherwise silently miss. The
-    bootstrap sets the window to 0 so those sudo writes apply on the first try."""
+    """Set and verify the administrative update window used by scenario setup."""
     with _connect(chain_endpoint) as client:
         block_hash = _submit(client, _sudo(
             client, _sdk().calls.AdminUtils.sudo_set_admin_freeze_window(window=window),
@@ -246,6 +320,55 @@ def dissolve_network(
     return block_hash
 
 
+def network_registration_block(netuid: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT) -> int:
+    with _connect(chain_endpoint) as client:
+        return int(client.query(_sdk().storage.SubtensorModule.NetworkRegisteredAt, [netuid]))
+
+
+def _set_subnet_u64(item: bytes, netuid: int, value: int, chain_endpoint: str) -> str:
+    """Write one entry of a per-netuid `SubtensorModule` map through Sudo."""
+    import xxhash
+
+    def twox128(data: bytes) -> bytes:
+        return b"".join(
+            xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in (0, 1)
+        )
+
+    # These maps are keyed by the netuid's own bytes (Identity hasher).
+    key = twox128(b"SubtensorModule") + twox128(item) + netuid.to_bytes(2, "little")
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sudo(
+            client, _sdk().calls.System.set_storage(items=[(key, value.to_bytes(8, "little"))]),
+        ))
+
+
+def set_network_registration_block(
+    netuid: int, block_number: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Rewrite a live subnet's registration block through Sudo, the way chain
+    migrations have done to extend a subnet's immunity period."""
+    block_hash = _set_subnet_u64(b"NetworkRegisteredAt", netuid, block_number, chain_endpoint)
+    written = network_registration_block(netuid, chain_endpoint=chain_endpoint)
+    if written != block_number:
+        raise ExtrinsicError(f"set_network_registration_block wrote {written}, wanted {block_number}")
+    return block_hash
+
+
+def set_subnet_alpha_in(
+    netuid: int, alpha_rao: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Rewrite the alpha side of a subnet's pool through Sudo. The localnet prices alpha
+    above one TAO, where the pool refuses no sale; deepening the alpha side brings the
+    price down to where most subnets trade. Read the result back through the alpha
+    precompile: emissions keep adding to it every block."""
+    return _set_subnet_u64(b"SubnetAlphaIn", netuid, alpha_rao, chain_endpoint)
+
+
+def keypair_pubkey(uri: str) -> str:
+    """The 32-byte public key of a dev URI, hex-encoded, as the vault and precompiles take it."""
+    return "0x" + bytes(_sdk().sp_core.Keypair.create_from_uri(uri).public_key).hex()
+
+
 def keypair_ss58(uri: str) -> str:
     """The ss58 address behind a dev key URI, for keys that only need an identity."""
     return _sdk().sp_core.Keypair.create_from_uri(uri).ss58_address
@@ -277,6 +400,32 @@ def swap_hotkey_keep_stake(
         ))
 
 
+def swap_hotkey(
+    hotkey_ss58: str, new_hotkey_ss58: str,
+    *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Rename a hotkey across every subnet, carrying its stake to the new name and
+    leaving the old name without an owner record. The chain records the
+    old -> new edge the vault follows."""
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.swap_hotkey_v2(
+            hotkey=hotkey_ss58, new_hotkey=new_hotkey_ss58, netuid=None, keep_stake=False,
+        ), signer_uri=signer_uri)
+
+
+def swap_hotkey_on_subnet(
+    hotkey_ss58: str, new_hotkey_ss58: str, netuid: int,
+    *, signer_uri: str = "//Alice", chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> str:
+    """Rename a hotkey on one subnet. The target may be any name with no owner
+    record, and the rename erases that name's own outgoing edge, which is how a
+    stranger can cut the trail the vault follows."""
+    with _connect(chain_endpoint) as client:
+        return _submit(client, _sdk().calls.SubtensorModule.swap_hotkey_v2(
+            hotkey=hotkey_ss58, new_hotkey=new_hotkey_ss58, netuid=netuid, keep_stake=False,
+        ), signer_uri=signer_uri)
+
+
 def associate_hotkey(
     hotkey_ss58: str, *, signer_uri: str = "//Alice",
     chain_endpoint: str = config.CHAIN_ENDPOINT,
@@ -289,16 +438,25 @@ def associate_hotkey(
         ), signer_uri=signer_uri)
 
 
-# The ownership map answers for every hotkey, so "nobody owns this" arrives as the
-# all-zero account rather than as an absent entry.
+def hotkey_is_registered(
+    hotkey_ss58: str, netuid: int, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
+) -> bool:
+    """Whether `hotkey_ss58` currently has subnet membership on `netuid`."""
+    with _connect(chain_endpoint) as client:
+        value = client.query(
+            _sdk().storage.SubtensorModule.IsNetworkMember, [hotkey_ss58, netuid],
+        )
+    return bool(value)
+
+
+# An unowned hotkey returns the zero account rather than an absent value; normalize it to an empty owner.
 UNOWNED_ACCOUNT = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"
 
 
 def hotkey_owner(
     hotkey_ss58: str, *, chain_endpoint: str = config.CHAIN_ENDPOINT,
 ) -> str:
-    """The coldkey recorded as owning `hotkey_ss58`, or "" when nobody does. This
-    record is what every stake operation checks the hotkey against."""
+    '''Return the hotkey owner, or "" when nobody owns it.'''
     with _connect(chain_endpoint) as client:
         value = client.query(_sdk().storage.SubtensorModule.Owner, [hotkey_ss58])
     owner = "" if value is None else str(value)

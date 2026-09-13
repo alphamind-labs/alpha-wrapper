@@ -4,13 +4,33 @@ These are well-known localnet/dev keys (substrate dev Alice, public test
 keys), not secrets. The chain, wallets, and contract layout the suite targets
 are all deterministic from these values.
 """
+import os
 
 # --- Chain -------------------------------------------------------------------
 CHAIN_ENDPOINT = "ws://127.0.0.1:9944"
 RPC_URL = "http://127.0.0.1:9944"
 CHAIN_ID = 42
 
+NETUID_BITS = 16
+BPS_BASE = 10_000
+UNDECLARED_SHORTFALL = 2**256 - 1
+ALPHA_PRICE_SCALE = 10**18
+ALPHA_PRICE_QUANTUM_E18 = 10**9
+VIRTUAL_SHARES = 10**9
+VIRTUAL_ASSETS = 1
+RAO_PER_TAO = 10**9
+
 # --- Wallets -----------------------------------------------------------------
+# The suite generates and overwrites keys, so it keeps them under a directory of
+# its own instead of the operator's btcli wallet directory.
+WALLET_PATH = os.path.abspath(
+    os.path.expanduser(
+        os.environ.get(
+            "ALPHA_E2E_WALLET_PATH",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".wallets"),
+        )
+    )
+)
 ALICE_WALLET = "alice"
 ALICE_HOTKEY_NAME = "default"
 ALICE_COLDKEY_SEED = "0xe5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a"
@@ -44,9 +64,16 @@ HOTKEY_SUFFIXES = ("a", "b", "c")
 VALIDATORS_PER_SUBNET = len(HOTKEY_SUFFIXES)
 TRANSFER_AMOUNT_TAO = 100
 # Per-validator transfer amount in RAO (TRANSFER_AMOUNT_TAO split across the 3 validators).
-PER_HOTKEY_TRANSFER_RAO = TRANSFER_AMOUNT_TAO * 10**9 // VALIDATORS_PER_SUBNET
+PER_HOTKEY_TRANSFER_RAO = TRANSFER_AMOUNT_TAO * RAO_PER_TAO // VALIDATORS_PER_SUBNET
 
 # --- Foundry / subprocess flags ------------------------------------------------
+# A localnet command that stops answering hangs the whole run, so every subprocess
+# gets a deadline; builds and deployments compile and broadcast, so they get a
+# longer one than a call or a send.
+COMMAND_TIMEOUT_SECONDS = 300
+CALL_TIMEOUT_SECONDS = 60
+DEPLOY_TIMEOUT_SECONDS = 900
+
 # Bittensor EVM: gas estimation fails; always use legacy txs with explicit gas.
 EVM_TX_FLAGS = ["--legacy", "--gas-price", "10000000000"]
 # AlphaVault's runtime is ~22.8 KB, so code deposit alone is ~4.6M gas; the ceiling clears that

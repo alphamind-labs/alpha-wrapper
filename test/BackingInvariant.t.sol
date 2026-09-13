@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-// Tests that random sequences of deposits, exits, rebalances, validator hotkey swaps, registry
-// rotations and recoveries never leave two record slots leaning on one balance, and never let the
-// position report more backing than the chain actually holds under its coldkey.
+pragma solidity 0.8.36;
 
 import { Test } from "forge-std/Test.sol";
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
@@ -18,8 +14,7 @@ contract BackingHandler is Test {
     uint256 public immutable netuid;
     address[] public actors;
 
-    /// @dev Every hotkey the run has ever staked under, so the harness can total the position's
-    ///      real holding independently of anything the vault records.
+    /// @dev Independent chain-total oracle, including keys no longer tracked by the vault.
     bytes32[] public touchedHotkeys;
     mapping(bytes32 => bool) public touched;
 
@@ -61,7 +56,8 @@ contract BackingHandler is Test {
     }
 
     function wrap(uint256 actorSeed, uint256 amount, uint256 hotkeySeed) external {
-        harness.wrapFor(_actor(actorSeed), bound(amount, 1 ether, 200 ether), _attested(hotkeySeed));
+        // Alpha in RAO: a TAO exit narrows slot balances to the chain's 64-bit stake amounts.
+        harness.wrapFor(_actor(actorSeed), bound(amount, 1e9, 200e9), _attested(hotkeySeed));
     }
 
     function unwrap(uint256 actorSeed, uint256 shareSeed) external {
@@ -69,7 +65,7 @@ contract BackingHandler is Test {
         uint256 balance = vault.balanceOf(actor, tokenId);
         if (balance == 0) return;
         vm.prank(actor);
-        try vault.unwrap(tokenId, bound(shareSeed, 1, balance), keccak256(abi.encode(actor))) { } catch { }
+        try vault.unwrap(tokenId, bound(shareSeed, 1, balance), keccak256(abi.encode(actor)), 0) { } catch { }
     }
 
     function unwrapForTao(uint256 actorSeed, uint256 shareSeed) external {
@@ -88,40 +84,46 @@ contract BackingHandler is Test {
         try vault.syncBacking(tokenId) { } catch { }
     }
 
-    /// @dev A validator swapping its hotkey, as the chain records it: the stake moves and the
-    ///      successor edge points at where it went.
     function swapHotkey(uint256 fromSeed, uint256 toSeed) external {
         bytes32 from = touchedHotkeys[bound(fromSeed, 0, touchedHotkeys.length - 1)];
         bytes32 to = keccak256(abi.encode("swapped", toSeed));
+        if (from == to) return;
         _remember(to);
         harness.simulateSwap(from, to);
     }
 
-    /// @dev The same move with no edge behind it - the shape a dust sweep and an erased swap trail
-    ///      both leave.
     function swapWithoutAnEdge(uint256 fromSeed, uint256 toSeed) external {
         bytes32 from = touchedHotkeys[bound(fromSeed, 0, touchedHotkeys.length - 1)];
         bytes32 to = keccak256(abi.encode("stray", toSeed));
+        if (from == to) return;
         _remember(to);
         harness.simulateSilentMove(from, to);
     }
 
     function recoverStray(uint256 sourceSeed) external {
-        if (vault.recordedSlots(tokenId).length == 0) return;
-        bytes32 source = touchedHotkeys[bound(sourceSeed, 0, touchedHotkeys.length - 1)];
-        bool[] memory coveredBefore = harness.coveredSlots();
+        uint256 slotsBefore = vault.recordedSlots(tokenId).length;
+        if (slotsBefore == 0) return;
+        bytes32 source =
+            touchedHotkeys[bound(uint256(keccak256(abi.encode(sourceSeed, uint256(0)))), 0, touchedHotkeys.length - 1)];
+        uint256 owedBefore = harness.trackedBacking();
+        uint256 supplyBefore = vault.totalSupply(tokenId);
         try vault.recoverStray(tokenId, source) {
-            bool[] memory coveredAfter = harness.coveredSlots();
-            bool hadShort;
-            bool healedOne;
-            for (uint256 i; i < coveredBefore.length; ++i) {
-                assertTrue(!coveredBefore[i] || coveredAfter[i], "recovery left a covered slot short");
-                if (!coveredBefore[i]) {
-                    hadShort = true;
-                    if (coveredAfter[i]) healedOne = true;
+            (uint64 since,) = vault.recovery(tokenId);
+            if (since == 0) {
+                bool[] memory covered = harness.coveredSlots();
+                for (uint256 i; i < covered.length; ++i) {
+                    assertTrue(covered[i], "completed recovery left a slot short");
                 }
+            } else {
+                assertEq(harness.trackedBacking(), owedBefore, "partial recovery changed the obligation");
             }
-            assertTrue(!hadShort || healedOne, "a successful recovery healed no slot");
+            assertEq(vault.totalSupply(tokenId), supplyBefore, "recovery changed the supply");
+            // The record is rewritten from live balances; those balances must still answer for what was owed.
+            assertGe(
+                harness.trackedBacking() + harness.recoverySlack(slotsBefore),
+                owedBefore,
+                "recovery discarded part of the obligation"
+            );
         } catch { }
     }
 
@@ -129,9 +131,8 @@ contract BackingHandler is Test {
         bytes32[] memory set = new bytes32[](bound(seed, 1, 3));
         for (uint256 i; i < set.length; ++i) {
             set[i] = touchedHotkeys[bound(uint256(keccak256(abi.encode(seed, i))), 0, touchedHotkeys.length - 1)];
-            // The registry rejects duplicates, so a repeat picks a fresh name instead.
             for (uint256 j; j < i; ++j) {
-                if (set[j] == set[i]) set[i] = keccak256(abi.encode("rotated", seed, i));
+                if (set[j] == set[i]) set[i] = keccak256(abi.encode("rotated", seed, i, touchedHotkeys.length));
             }
             _remember(set[i]);
         }
@@ -143,6 +144,8 @@ contract BackingHandler is Test {
     }
 }
 
+/// forge-config: default.invariant.fail-on-revert = true
+/// forge-config: ci.invariant.fail-on-revert = true
 contract BackingInvariantTest is AlphaVaultTestBase {
     BackingHandler internal handler;
     bytes32[] internal currentSet;
@@ -152,7 +155,7 @@ contract BackingInvariantTest is AlphaVaultTestBase {
         address[] memory actors = new address[](2);
         actors[0] = alice;
         actors[1] = bob;
-        _depositAndWrap(alice, NETUID1, 50 ether);
+        _depositAndWrap(alice, NETUID1, 50 * ALPHA);
 
         currentSet = _hotkeys(hotkey1, hotkey2, hotkey3);
         bytes32[] memory seeds = _hotkeys(hotkey1, hotkey2, hotkey3);
@@ -164,21 +167,36 @@ contract BackingInvariantTest is AlphaVaultTestBase {
         return currentSet;
     }
 
-    /// @dev Which slots the resolver can currently account for.
+    function backingIntact() external view returns (bool) {
+        return lens.isBackingIntact(TOKEN1);
+    }
+
+    function trackedBacking() public view returns (uint256 owed) {
+        VaultReads.Slot[] memory slots = vault.recordedSlots(TOKEN1);
+        for (uint256 i; i < slots.length; ++i) {
+            owed += slots[i].tracked;
+        }
+    }
+
+    function recoverySlack(uint256 slots) external pure returns (uint256) {
+        return BACKING_SLACK_RAO * slots;
+    }
+
     function coveredSlots() external view returns (bool[] memory covered) {
         VaultReads.Slot[] memory slots = vault.recordedSlots(TOKEN1);
         covered = new bool[](slots.length);
         bytes32 coldkey = _subnetColdkey(NETUID1);
-        VaultReads.Backing memory backing = VaultReads.resolveBacking(slots, coldkey, uint16(NETUID1));
         for (uint256 i; i < slots.length; ++i) {
-            covered[i] = !backing.short[i];
+            uint256 held = _getStakeForColdkey(slots[i].active, coldkey, NETUID1);
+            // Check the chain ledger directly; recovery must leave each persisted slot covered.
+            covered[i] = held >= slots[i].tracked || slots[i].tracked - held <= BACKING_SLACK_RAO;
         }
     }
 
     function wrapFor(address user, uint256 amount, bytes32 hotkey) external {
         _simulateAlphaDepositHotkey(user, NETUID1, amount, hotkey);
         vm.prank(user);
-        try vault.wrap(NETUID1, hotkey) { } catch { }
+        try vault.wrap(NETUID1, hotkey, 0) { } catch { }
     }
 
     function simulateSwap(bytes32 from, bytes32 to) external {
@@ -197,13 +215,42 @@ contract BackingInvariantTest is AlphaVaultTestBase {
             assigned += weights[i];
         }
         weights[set.length - 1] = BPS_BASE - assigned;
+        for (uint256 i; i < set.length; ++i) {
+            _simulateHotkeyOwnerPresent(set[i]);
+        }
         _setValidators(NETUID1, set, weights);
         currentSet = set;
     }
 
-    /// @dev The property the record exists to hold: one balance backs one expectation. Two slots
-    ///      naming one key would report that balance twice and price exits against backing that is
-    ///      not there.
+    function test_ReplayMergedStrayRecovery_PreservesBackingInvariants() public {
+        handler.swapWithoutAnEdge(3920, 702498195375104724870804370661893358612984996200603330987954554);
+        handler.swapWithoutAnEdge(21936, 9555);
+        handler.swapWithoutAnEdge(0, 46484125467125653278869020054723548665048815226470);
+        handler.syncBacking();
+        handler.recoverStray(361656362808158655897425226168322);
+        handler.swapHotkey(395928111782571441, 47594521996258548997527314557814977391483923631630328760470);
+        handler.swapWithoutAnEdge(115792089237316195423570985008687907853269984665640564039457584007913129639932, 2);
+        handler.syncBacking();
+        handler.recoverStray(496832458824593621465406068473474564241632359248770171723107483670860501638);
+        handler.swapHotkey(1000000000000000000, 518);
+        handler.swapHotkey(39284778829218561959962831765498513039391595077, 1);
+        handler.swapHotkey(4668825657844413095552775974875155388807116336350818157329463057335574, 863968505977431908);
+        handler.rotateValidators(25670646866713597079810818809857953515987733532491365243132352747204520724);
+        handler.wrap(4982, 2038218518, 126689249586524825498559537986693588869175255532239560737778380983908754);
+        handler.swapHotkey(
+            5022836071830231965563198741131435959745735624404810078992442116285814296610,
+            10708288936997174409238467093412100671917613552582
+        );
+        handler.swapWithoutAnEdge(2720838758, 2641);
+        handler.swapWithoutAnEdge(2151, 2641);
+        handler.syncBacking();
+        handler.recoverStray(115792089237316195423570985008687907853269984665640564039457584007913129639935);
+
+        invariant_TotalTrackedBackingIsBoundedByCurrentChainHoldings();
+        invariant_NoTwoSlotsAnswerForOneKey();
+        invariant_ReportedBackingNeverExceedsWhatTheChainHolds();
+    }
+
     function invariant_NoTwoSlotsAnswerForOneKey() public view {
         VaultReads.Slot[] memory slots = vault.recordedSlots(TOKEN1);
         for (uint256 i; i < slots.length; ++i) {
@@ -213,30 +260,21 @@ contract BackingInvariantTest is AlphaVaultTestBase {
         }
     }
 
-    /// @dev What the position reports can fall short of what the chain holds - that is a loss being
-    ///      chased - but it may never exceed it.
     function invariant_ReportedBackingNeverExceedsWhatTheChainHolds() public view {
-        uint256 held;
-        bytes32[] memory keys = handler.knownHotkeys();
-        for (uint256 i; i < keys.length; ++i) {
-            held += _getVaultStake(keys[i], NETUID1);
-        }
-        assertLe(lens.locatedStake(TOKEN1), held, "the position reports backing the chain does not hold");
+        assertLe(lens.locatedStake(TOKEN1), _chainHoldings(), "the position reports backing the chain does not hold");
     }
 
-    /// @dev Every expectation the record still stands behind has to be one the chain could still
-    ///      satisfy, or the write-off would give up on more than ever went missing.
-    function invariant_NoSlotIsOwedMoreThanTheChainEverHeld() public view {
-        VaultReads.Slot[] memory slots = vault.recordedSlots(TOKEN1);
-        uint256 owed;
-        for (uint256 i; i < slots.length; ++i) {
-            owed += slots[i].tracked;
-        }
-        uint256 held;
+    function invariant_TotalTrackedBackingIsBoundedByCurrentChainHoldings() public view {
+        uint256 slots = vault.recordedSlots(TOKEN1).length;
+        assertLe(trackedBacking(), _chainHoldings() + BACKING_SLACK_RAO * slots, "the record expects more than exists");
+    }
+
+    /// @dev Every key the campaign touched plus the parking hotkey, where recoveries and write-offs land.
+    function _chainHoldings() private view returns (uint256 held) {
         bytes32[] memory keys = handler.knownHotkeys();
         for (uint256 i; i < keys.length; ++i) {
             held += _getVaultStake(keys[i], NETUID1);
         }
-        assertLe(owed, held + VaultReads.TRACKED_SLACK_RAO * slots.length, "the record expects more than exists");
+        held += _parkedStake(NETUID1);
     }
 }

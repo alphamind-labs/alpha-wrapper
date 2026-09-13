@@ -1,20 +1,47 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { VaultReads } from "src/libraries/VaultReads.sol";
-import { BackingShortfall } from "src/VaultErrors.sol";
-import { MockStaking } from "./mocks/MockStaking.sol";
-import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
+import { AttestedHotkeyRetired, BackingShortfall, ShortfallOnFile } from "src/VaultErrors.sol";
+import { IAlphaVaultAbi } from "src/interfaces/IAlphaVaultAbi.sol";
+import { CHAIN_MIN_TRANSFER, MockStaking } from "./mocks/MockStaking.sol";
+import { IStaking, STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
 
-/// @dev Covers what the one-hop resolver refuses: trails it will not walk, edges the chain never
-///      recorded, and collisions where one balance would answer for two slots. Getting a refused
-///      position back lives in BackingRecovery.t.sol.
 contract BackingResolutionTest is AlphaVaultTestBase {
-    // -------------------- Fail closed on an unexplained shortfall ----------------
+    function test_SelfSuccessorResponse_LeavesBackingAndValidatorsUnchanged() public {
+        _depositAndWrap(alice, NETUID1, 30e9);
+        bytes32[] memory keysBefore = lens.lastSeenHotkeys(TOKEN1);
+        MockStaking(STAKING_PRECOMPILE).setHotkeySuccessor(hotkey1, NETUID1, hotkey1);
 
-    /// @dev A second edge is never read, so a deposit's worth of backing two swaps away is a loss
-    ///      for the watcher to resolve, and every path that prices shares or moves alpha waits.
+        assertEq(lens.totalStake(TOKEN1), 30e9);
+        assertTrue(lens.isBackingIntact(TOKEN1));
+        vault.rebalance(NETUID1);
+
+        assertEq(lens.totalStake(TOKEN1), 30e9);
+        assertEq(lens.lastSeenHotkeys(TOKEN1), keysBefore);
+        assertEq(_vaultStakeAcross(keysBefore, NETUID1), 30e9);
+        assertTrue(lens.isBackingIntact(TOKEN1));
+    }
+
+    function test_SelfSuccessorWithMissingBacking_LeavesTheShortfallUnresolved() public {
+        _depositAndWrap(alice, NETUID1, 30e9);
+        bytes32[] memory keysBefore = lens.lastSeenHotkeys(TOKEN1);
+        uint256 tracked = _getVaultStake(hotkey1, NETUID1);
+        uint256 missing = 2 * BACKING_SLACK_RAO;
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, _subnetColdkey(NETUID1), NETUID1, tracked - missing);
+        MockStaking(STAKING_PRECOMPILE).setHotkeySuccessor(hotkey1, NETUID1, hotkey1);
+
+        // A shortfall forces a successor lookup; naming itself cannot supply missing alpha.
+        vm.expectCall(STAKING_PRECOMPILE, abi.encodeCall(IStaking.getHotkeySuccessor, (hotkey1, uint16(NETUID1))));
+        assertFalse(lens.isBackingIntact(TOKEN1));
+        vm.expectRevert(abi.encodeWithSelector(BackingShortfall.selector, NETUID1, hotkey1, tracked));
+        vault.rebalance(NETUID1);
+
+        assertEq(lens.lastSeenHotkeys(TOKEN1), keysBefore);
+        assertEq(_vaultStakeAcross(keysBefore, NETUID1), 30e9 - missing);
+    }
+
     function test_TwoHopSwap_FailsClosedOnEveryPath() public {
         uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
         _depositAndWrap(bob, NETUID1, 30 ether);
@@ -36,17 +63,15 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         _simulateAlphaDeposit(bob, NETUID1, 1 ether);
         vm.prank(bob);
         vm.expectPartialRevert(BackingShortfall.selector);
-        vault.wrap(NETUID1, hotkey1);
+        vault.wrap(NETUID1, hotkey1, 0);
         vm.prank(alice);
         vm.expectPartialRevert(BackingShortfall.selector);
-        vault.unwrap(TOKEN1, shares / 2, _toSubstrate(alice));
+        vault.unwrap(TOKEN1, shares / 2, _toSubstrate(alice), 0);
         vm.prank(bob);
         vm.expectPartialRevert(BackingShortfall.selector);
         vault.unwrapForTao(TOKEN1, shares / 4, 0);
     }
 
-    /// @dev Share transfers and the native TAO a holder has already earned belong to the holder
-    ///      whatever the alpha is doing, so neither waits on a recovery window.
     function test_ShortfallStanding_LeavesTransfersAndTaoClaimsLive() public {
         uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
         _donateToClone(vault.subnetClone(TOKEN1), 4 ether);
@@ -62,7 +87,6 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         _claimQuotedAmount(alice, TOKEN1);
     }
 
-    /// @dev Each slot answers for its own expectation, so growth elsewhere cannot cover a loss.
     function test_GrowthElsewhere_DoesNotCoverALoss() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         uint256 lost = _getVaultStake(hotkey1, NETUID1);
@@ -77,26 +101,30 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(NETUID1);
     }
 
-    /// @dev One balance cannot back two slots, so a successor another slot already answers for is
-    ///      refused however the two got there.
-    function test_ConvergentSwaps_FailClosed() public {
+    function test_ConvergentSwaps_FailClosedUntilParked() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         bytes32 coldkey = _subnetColdkey(NETUID1);
         uint256 merged = _getVaultStake(hotkey1, NETUID1) + _getVaultStake(hotkey2, NETUID1);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, coldkey, NETUID1, 0);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey2, coldkey, NETUID1, 0);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey4, coldkey, NETUID1, merged);
+        _simulateSameOwner(hotkey1, hotkey4);
         MockStaking(STAKING_PRECOMPILE).setHotkeySuccessor(hotkey1, NETUID1, hotkey4);
         MockStaking(STAKING_PRECOMPILE).setHotkeySuccessor(hotkey2, NETUID1, hotkey4);
 
         assertFalse(lens.isBackingIntact(TOKEN1), "the quote sees the collision");
         vm.expectPartialRevert(BackingShortfall.selector);
         vault.rebalance(NETUID1);
+
+        // Everything is on recorded keys, so the collision parks without a watcher-supplied source.
+        vault.syncBacking(TOKEN1);
+
+        assertTrue(lens.isBackingIntact(TOKEN1), "the merged balance is counted once on the parking hotkey");
+        assertEq(lens.totalStake(TOKEN1), 30 ether, "and nothing was lost in the collision");
+        assertEq(_parkedStake(NETUID1), 30 ether, "all of it rests on the parking hotkey");
     }
 
-    /// @dev Pins the resolver's cover guard against a state the chain's whole-entry moves cannot
-    ///      produce: a successor explaining only part of the loss is no explanation, and accepting
-    ///      it would report the rest as backing that is not there.
+    /// @dev Synthetic partial migration exercises the coverage guard; ordinary swaps move whole entries.
     function test_PartialSuccessor_FailsClosed() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         bytes32 coldkey = _subnetColdkey(NETUID1);
@@ -110,24 +138,24 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(NETUID1);
     }
 
-    /// @dev Pins the resolver's zero-residual guard against a split the chain's whole-entry moves
-    ///      cannot produce: a slot spread across two keys is more than the record can carry, so
-    ///      the case goes to the watcher rather than down the follow.
-    function test_SuccessorWithAResidualLeftBehind_FailsClosed() public {
-        _depositAndWrap(alice, NETUID1, 30 ether);
+    function test_SuccessorWithAResidualLeftBehind_StaysOperable() public {
+        uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
+        uint256 accounted = lens.totalStake(TOKEN1);
         bytes32 coldkey = _subnetColdkey(NETUID1);
         uint256 owed = _getVaultStake(hotkey1, NETUID1);
-        MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, coldkey, NETUID1, owed / 4);
+        MockStaking(STAKING_PRECOMPILE).setStake(hotkey1, coldkey, NETUID1, CHAIN_MIN_TRANSFER);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey4, coldkey, NETUID1, owed);
         MockStaking(STAKING_PRECOMPILE).setHotkeySuccessor(hotkey1, NETUID1, hotkey4);
+        _simulateSameOwner(hotkey1, hotkey4);
 
-        assertFalse(lens.isBackingIntact(TOKEN1), "two piles for one slot is not a clean swap");
-        vm.expectPartialRevert(BackingShortfall.selector);
+        assertTrue(lens.isBackingIntact(TOKEN1), "stray stake cannot block the recorded successor");
+        assertEq(lens.totalStake(TOKEN1), accounted, "the residual is not counted twice");
         vault.rebalance(NETUID1);
+
+        vm.prank(alice);
+        vault.unwrap(TOKEN1, shares / 4, _toSubstrate(alice), 0);
     }
 
-    /// @dev A swap can carry one slot's alpha onto a key another slot has itself moved off. Nothing
-    ///      answers twice there, so the follow is allowed and the token stays operable.
     function test_SwapOntoAKeyAnotherSlotLeft_StaysOperable() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         _simulateFollowedSwap(NETUID1, hotkey2, hotkey5);
@@ -137,25 +165,19 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(NETUID1);
 
         assertTrue(lens.isBackingIntact(TOKEN1), "no balance answers for two slots");
-        assertApproxEqAbs(lens.totalStake(TOKEN1), 30 ether, 0.01 ether, "the whole position is counted once");
+        assertEq(lens.totalStake(TOKEN1), 30 ether, "the whole position is counted once");
         uint256 quarter = vault.balanceOf(alice, TOKEN1) / 4;
         vm.prank(alice);
-        vault.unwrap(TOKEN1, quarter, _toSubstrate(alice));
+        vault.unwrap(TOKEN1, quarter, _toSubstrate(alice), 0);
     }
 
-    /// @dev A swap can leave one validator's alpha sitting under another validator's attested
-    ///      name. If an emptied slot then fell back onto its own name, that name could be the key
-    ///      another slot already answers for, and the position would report the same balance twice
-    ///      - pricing exits against backing that is not there.
+    /// @dev Falling back to a logical name now occupied by another slot would count one balance twice.
     function test_TaoExitEmptyingASwappedSlot_LeavesNoBalanceAnsweringTwice() public {
         uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
         _simulateFollowedSwap(NETUID1, hotkey1, hotkey4);
         vault.rebalance(NETUID1);
-        // hotkey2's alpha lands on hotkey1 - a name the attesters still list, whose own slot has
-        // moved on to hotkey4.
         _simulateFollowedSwap(NETUID1, hotkey2, hotkey1);
 
-        // Sell enough to empty the hotkey4 slot outright.
         uint256 burn = (shares * (_getVaultStake(hotkey4, NETUID1) + 1e15)) / lens.locatedStake(TOKEN1);
         vm.prank(alice);
         vault.unwrapForTao(TOKEN1, burn, 0);
@@ -172,9 +194,6 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         }
     }
 
-    /// @dev The settle after such an exit faces the same trap: the emptied slot's attested name
-    ///      carries another validator's alpha, so the slot keeps its own resolved key instead of
-    ///      falling back onto the name.
     function test_SettleAfterAnEmptyingExit_KeepsSlotsOnDistinctKeys() public {
         uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
         _simulateFollowedSwap(NETUID1, hotkey1, hotkey4);
@@ -195,14 +214,36 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         }
         assertEq(slots[0].active, hotkey4, "the emptied slot kept its resolved key");
         assertEq(slots[1].active, hotkey1, "beside the slot whose alpha its name carries");
-        assertApproxEqAbs(lens.totalStake(TOKEN1), held, 0.01 ether, "and the total counts each balance once");
+        assertEq(lens.totalStake(TOKEN1), held, "and the total counts each balance once");
     }
 
-    // -------------------- Emptyings the chain does not explain -------------------
+    function _positionWithAnEmptiedSlotOnAnotherKey() private {
+        _depositAndWrap(alice, NETUID1, 30 ether);
+        _simulateFollowedSwap(NETUID1, hotkey1, hotkey4);
+        vault.rebalance(NETUID1);
+        _simulatePerSubnetSwap(NETUID1, hotkey2, hotkey1);
+        _drainTheFirstSlot(alice, NETUID1);
+    }
 
-    /// @dev A dust sweep records nothing at all, and a swap leaves the same silence once its edge
-    ///      is dropped - so reading silence as a sweep would let an operator take the alpha and
-    ///      have the vault reprice the token beneath its holders.
+    function test_SetNamingTheKeyAnEmptiedSlotStaysOn_Refuses() public {
+        _positionWithAnEmptiedSlotOnAnotherKey();
+
+        _setValidators(NETUID1, _hotkeys(hotkey1, hotkey4, hotkey2), _weights(3334, 3333, 3333));
+
+        vm.expectRevert(IAlphaVaultAbi.SwappedHotkeyStillAttested.selector);
+        vault.rebalance(NETUID1);
+    }
+
+    function test_EmptiedSlotWhoseKeyIsRetired_RefusesTheRebalance() public {
+        _positionWithAnEmptiedSlotOnAnotherKey();
+
+        MockStaking(STAKING_PRECOMPILE).setHotkeyDeleted(hotkey4, true);
+
+        vm.expectRevert(abi.encodeWithSelector(AttestedHotkeyRetired.selector, hotkey1));
+        vault.rebalance(NETUID1);
+    }
+
+    /// @dev No edge distinguishes a dust sweep from an erased swap trail; neither permits immediate repricing.
     function test_EdgeFreeEmptying_FailsClosed() public {
         uint256 netuid = 5;
         _registerSubnet(netuid, hotkey1);
@@ -216,8 +257,6 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(netuid);
     }
 
-    /// @dev The same silence with the alpha demonstrably alive under another key. The vault has no
-    ///      way to tell this from the case above and does not guess between them.
     function test_SwapWithNoEdge_FailsClosed() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         _simulateOffVaultSwap(NETUID1, hotkey1, hotkey4);
@@ -228,8 +267,6 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(NETUID1);
     }
 
-    /// @dev Nothing in the decision reads a price, so neither the size of the loss nor the price of
-    ///      alpha touches the verdict.
     function test_EdgeFreeEmptying_RefusesAtAnyPriceOrSize() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         bytes32 coldkey = _subnetColdkey(NETUID1);
@@ -243,8 +280,6 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         vault.rebalance(NETUID1);
     }
 
-    /// @dev A position the chain really did empty. Nobody can find alpha that no longer exists, so
-    ///      the window runs out on it and the token comes back with the loss socialized.
     function test_SweptPosition_ReopensAfterTheWindow() public {
         uint256 shares = _depositAndWrap(alice, NETUID1, 30 ether);
         bytes32 coldkey = _subnetColdkey(NETUID1);
@@ -256,34 +291,29 @@ contract BackingResolutionTest is AlphaVaultTestBase {
         _runOutRecoveryWindow(TOKEN1);
 
         vm.prank(alice);
-        vault.unwrap(TOKEN1, shares, _toSubstrate(alice));
+        vault.unwrap(TOKEN1, shares, _toSubstrate(alice), 0);
         assertEq(vault.totalSupply(TOKEN1), 0, "the shares retire against what is left");
 
+        _reattestCurrentSet(NETUID1);
         _depositAndWrap(bob, NETUID1, 30 ether);
-        assertGt(vault.balanceOf(bob, TOKEN1), 0, "the token recapitalizes after the window");
+        assertGt(vault.balanceOf(bob, TOKEN1), 0, "the token recapitalizes once the attesters publish again");
     }
 
-    /// @dev The registry is allocation policy and nothing more: rotating a validator in neither
-    ///      settles a standing loss nor brings that validator's own balance into the count.
     function test_RegistryUpdate_NeitherClearsALossNorAddsBacking() public {
         _depositAndWrap(alice, NETUID1, 30 ether);
         uint256 located = lens.locatedStake(TOKEN1);
+        uint256 lost = _getVaultStake(hotkey1, NETUID1);
         _buildSwapTrail(NETUID1, hotkey1, 2);
         vault.syncBacking(TOKEN1);
 
-        // hotkey4 comes in already holding alpha of the vault's, which no slot answers for.
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey4, _subnetColdkey(NETUID1), NETUID1, 9 ether);
         _setValidators(
             NETUID1, _hotkeys(hotkey4, hotkey2, hotkey3), _weights(NETUID1_BPS_HK1, NETUID1_BPS_HK2, NETUID1_BPS_HK3)
         );
 
         assertFalse(lens.isBackingIntact(TOKEN1), "the rotation settled nothing");
-        assertEq(lens.locatedStake(TOKEN1), located - _lostToTheTrail(located), "and added no backing of its own");
-        vm.expectPartialRevert(BackingShortfall.selector);
+        assertEq(lens.locatedStake(TOKEN1), located - lost, "and added no backing of its own");
+        vm.expectRevert(ShortfallOnFile.selector);
         vault.rebalance(NETUID1);
-    }
-
-    function _lostToTheTrail(uint256 located) private view returns (uint256) {
-        return located - _getVaultStake(hotkey2, NETUID1) - _getVaultStake(hotkey3, NETUID1);
     }
 }

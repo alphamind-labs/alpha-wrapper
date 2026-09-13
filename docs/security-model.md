@@ -1,113 +1,162 @@
 # Security model
 
-## Who can do what
+## Authority and trust
 
-The vault is permissionless: it has no privileged roles, and every
-function is either open to everyone or acts only on the caller's own
-balance and mailbox. Its code and registry address are final at
-deployment.
+The vault has no admin or upgrade path. Only it can drive its mailbox and subnet
+clones. Validator authority depends on the registry selected at deployment:
 
-The only privileged parties live in `ValidatorRegistry`:
+- `ValidatorRegistry`: quorum signers choose validator weights; its admin manages
+  signers and admins.
+- `BasicValidatorRegistry`: one owner chooses a single hotkey per subnet at 100%
+  weight. OpenZeppelin two-step ownership transfers require the nominated successor
+  to accept; the existing owner retains authority until then. Renunciation is disabled.
 
-- The signers, threshold-of-N, choose validator sets and weights per
-  subnet by co-signing attestations
-  ([attester-guide.md](attester-guide.md)).
-- The registry admin rotates the signer set and threshold. The role
-  administers itself, so an admin can also add or remove admins; it has
-  no other power.
+Neither registry's administrators nor signers can directly withdraw backing,
+mint/burn users' shares, access their mailboxes or change vault code.
 
-## What the privileged parties cannot do
+A Basic owner can rotate its key while it still has access, or nominate a successor
+who can later accept independently. If the owner key is lost with no accessible
+pending successor, registry updates are permanently unavailable. Any position that
+parks cannot be released: deposits and rebalance remain blocked, while parked exits
+remain available. Changing the owner alone does not advance registry nonces; the
+new owner must publish a validator update to release recovered parking.
 
-Registry control steers where stake is delegated, nothing else. The
-signers - or an admin who replaces them all with its own keys - can point
-the vault's stake at validators of their choosing, and bad choices cost
-holders emissions. They cannot transfer stake out of the vault, mint or
-burn shares, touch mailboxes, or change any vault code or parameter.
+Registry choices affect emissions and transaction availability. The TAO exit
+ignores registry weights, but cannot bypass source ownership, missing backing,
+dissolution, chain minimums or pool constraints. A hostile set is not harmless
+merely because that exit exists.
 
-A hostile validator set can break wrapping and the alpha exit, since
-deposits must name a listed hotkey and stake cannot be moved onto
-validators that do not exist. It cannot lock funds in: the TAO
-exit never moves stake between validators, it sells from wherever the
-stake actually sits, so holders can still leave with TAO, if need be
-over several sales.
+Holders rely on:
 
-## What holders trust
+- Subtensor and its precompiles for stake ownership, moves, accounting and refunds.
+  Creation requires `getHotkeyOwner`, `getOwnedHotkeys`, `getColdkeyRoot`,
+  `getColdkeyLock`, `getRejectLockedAlpha` and
+  `tryAssociateHotkey`. The lineage and ownership readers must reflect current
+  runtime storage; an unsupported runtime cannot prepare clones.
+- Registry governance and validator performance.
+- A funded, responsive watcher to repair unresolved swaps and park backing, and
+  a registry authority that publishes a new set to release a parked position
+  (quorum attesters or the Basic owner). Watcher calls are permissionless; publishing
+  requires that registry's authorization. Neither has an on-chain completion guarantee.
+- Trusted vault/lens builds and addresses. The lens's `vault()` checks pairing,
+  not authenticity; mid-operation callback quotes may observe unfinished state.
 
-- The Bittensor chain. The staking, alpha, subnet and address-mapping
-  precompiles, plus the `ValidatorRegistry` it reads validator sets
-  from, are the vault's only external dependencies, and all accounting
-  reads stake balances straight from the chain.
-- The performance of the attested validators: emissions accrue, or do
-  not, according to where the registry points the stake.
-- The registry quorum and its admin key, within the boundary above.
-- Whoever told them which lens to read, and which build of it. Quotes come
-  from a separate read-only contract that names its vault through `vault()`
-  while the vault names no lens in return. The pairing check catches a
-  mismatched lens and stops there: any contract can answer `vault()`
-  correctly and still invent every quote, and a lens compiled from changed
-  shared-library source answers for the same vault while computing
-  differently. The lens itself can move no stake and mint no shares, so a
-  person reading a number off the wrong one is misinformed. A contract that
-  sizes a slippage bound from a quote can be walked into a bad fill, which
-  is why an integrator pins a reviewed lens address and its runtime code
-  instead of accepting one at call time.
+## Safeguards
 
-## Design safeguards
+- Separate clones isolate each subnet registration's backing.
+- Mailbox collection only credits its depositor; outsiders cannot collect it.
+- Stake-moving and native-payout entry points are non-reentrant. Share changes
+  checkpoint claimable TAO before recipient acceptance callbacks.
+- Virtual shares/assets limit first-depositor inflation; a supply cap protects
+  claim-index precision.
+- Caller-selected minimum outputs make insufficient fills revert atomically.
+- Unresolved backing blocks live pricing and exits until the position parks or
+  the loss is written off; recovery moves only the vault's own stake, onto a
+  hotkey only the vault's coldkey controls.
+- A receiving key is usable only under the coldkey that owned the registry-listed name;
+  a name claimed by anyone else receives nothing.
+- Alpha exits avoid pool trades. TAO exits are opt-in market sales with fees and
+  price impact, including price impact borne by remaining holders.
+- Mailboxes and subnet clones are checked and protected at creation, so locked
+  alpha never backs a share.
 
-- Per-subnet isolation. Each position's alpha sits under its own clone
-  coldkey; one subnet's dissolution or misbehavior cannot touch another
-  position's backing.
-- Clones obey only the vault. Every mailbox and subnet-clone function
-  reverts for other callers, and initialization is one-shot, vault-only.
-  The one thing outsiders can do is send a clone TAO, which the claim
-  index absorbs ([edge-cases.md](edge-cases.md)).
-- `wrap` credits only the caller's own mailbox, so nobody can claim
-  someone else's deposit.
-- Every entry point that moves stake or native TAO is `nonReentrant`,
-  and payouts come after burns.
-- First-depositor share-price inflation is blunted with virtual shares
-  and assets (the ERC-4626 pattern), and a share-supply cap keeps the
-  TAO claim index exact.
-- Market-order exits are slippage-bounded by the caller's `minTaoOut`.
-- Backing the vault cannot account for shuts every share-pricing and
-  alpha-moving path rather than being priced around, so an understated
-  total can never be minted or redeemed against. Recovery is open to
-  anyone and can only move alpha between the vault's own keys, so it
-  needs no permission and grants none
-  ([design/backing-resolution.md](design/backing-resolution.md)).
+## Why clone contamination matters
 
-## Known tradeoffs
+A coldkey swap can plant locks, account settings and ownership roles on any
+account that stakes nothing, including a future mailbox or subnet clone, without
+its consent. A poisoned mailbox blocks its user's deposit. Locked alpha priced
+as backing would let an attacker mint shares and exit with honest holders'
+unlocked alpha, leaving them alpha that neither exit can move.
 
-- The netuid-scoped dissolution blackout can temporarily freeze an old
-  position while a successor subnet on the same netuid dissolves
-  ([edge-cases.md](edge-cases.md)).
-- Amounts below the chain's minimum stake size can leave the stake split
-  drifted from target weights; share value is unaffected.
-- `wrap` reads the caller's mailbox only under the chosen key. A hotkey
-  swap landing between deposit and wrap carries the deposit to the new
-  key, and the wrap reverts until the owner reclaims and retries
-  ([user-guide.md](user-guide.md)). The deposit stays the owner's
-  throughout; the manual retry is the accepted price of a wrap that
-  never guesses where a deposit went. When every attested key has
-  swapped away at once, deposits wait for the next attestation to name
-  a live key; exits and quotes keep working through the record.
-- A partial `unwrapForTao` can fill short and refund the unsold part as
-  shares instead of reverting; callers bound the damage with
-  `minTaoOut`.
-- A quorum-signed attestation stays submittable until one lands for its
-  subnet, so a list the signers have moved away from can still be
-  installed by anyone holding its signatures. Landing a replacement is
-  what retires it.
-- Backing that goes missing shuts the token - exits included - for up to
-  the recovery window fixed at deployment (`recoveryWindow`), and holders
-  wait that out. The design buys a watcher time to preserve the backing
-  and then chooses liveness over waiting longer.
-- Backing nobody recovers inside that window is written off across the
-  holders of the moment, and alpha found afterwards accrues to whoever
-  holds shares then. Whoever knows where that alpha sits can deposit at
-  the written-down price first and recover it second, taking most of it
-  from the holders who bore the loss. Accepted policy rather than an
-  accident; the vault has no recapitalization mechanism.
-- The vault relies on someone watching it. Nothing is lost if no one
-  does - the window still runs and the token still reopens - but the
-  missing alpha is then socialized rather than recovered.
+- Creation checks the candidate chosen by the caller's UID for code, ownership,
+  swap history and locks, rejects a poisoned one so the caller retries with a
+  fresh UID, then has the clone claim its own account as a hotkey it owns. The
+  chain refuses coldkey swaps into existing hotkeys, so the protection holds at
+  zero stake, and a clone has no function that could rename or hand over that
+  hotkey. Creation also verifies that the clone rejects locked-alpha transfers.
+- An unexpected lock fails closed: a locked mailbox cannot be wrapped, and a
+  locked subnet clone stops prices, deposits, alignment and exits until the lock
+  clears. Recovery reads and accrued TAO claims stay available.
+
+The cost is one creation transaction per user; the first user of a subnet
+generation also pays for the shared clone. A UID is public once submitted, so a
+front-run creation can fail and need a retry with a new UID. Ordinary
+unlocked-alpha and TAO donations remain allowed.
+
+## Recovery-window tradeoff and late-recovery attack
+
+The [hotkey-swap runbook](hotkey-swaps.md) separates two failures: names that
+answer to the wrong coldkey and unlocated alpha. A registry update repairs the first.
+`syncBacking` handles the second: it moves all located backing onto the vault's
+parking hotkey before starting one fixed recovery window, with a dust exception:
+if even the richest source or parking balance is below the conservative movement
+floor, collection leaves those balances in place without delaying the window.
+Every sync retries collection before write-off, so a larger return or price rise
+can bring the dust home. Other collection failures revert without changing the
+clock or obligation; persistent chain restrictions can still delay recovery.
+A native precompile refusal consumes forwarded gas, even though state rolls back.
+
+The conservative floor uses `DefaultMinStake`: 0.002 TAO in [Subtensor `14cde6410`](https://github.com/opentensor/subtensor/blob/14cde6410fe8ec81a940e290c56f94a632a0988d/runtime/src/lib.rs#L841),
+20 times its 0.0001 TAO same-subnet transfer minimum. Thus some chain-movable
+balances can be skipped and written off. Ten skipped locations expose less than
+0.02 TAO at the floor check's price, not at a future price. Using the lower
+transfer minimum is a separate compatibility change.
+
+Recovery counts one expected total and one pool of located alpha, without assigning
+finds to validators. After sync declares a loss, `recoverStray(tokenId, source)`
+parks one source per call. Only sync finalizes recovery, collecting returns at
+recorded locations first. Neither call extends the clock.
+Validator swaps cannot move the secured balance off the vault-owned parking hotkey.
+At expiry, sync collects returns before writing off the remaining deficit,
+including any dust still outside parking. The dust exposure is per skipped
+location, valued at the floor check's price; it is not a bound on future alpha
+value. A movable pile gathers smaller balances too. Late dust recovery requires
+explicit source keys and belongs to holders at that later time.
+Full recovery or write-off leaves the position parked pending a newer registry update.
+
+Write-off chooses repricing over indefinite waiting for missing alpha. It is a
+real loss of accounted backing for holders at finalization, not proof the alpha
+was destroyed. Any later recovery belongs to whoever holds shares then.
+
+A validator can exploit that policy:
+
+1. Swap its hotkey, carrying vault alpha, then re-register the old key on the
+   subnet to erase the successor edge.
+2. If watchers cannot park the funded key in time, finalize the write-off.
+3. Once the registry authority publishes again, deposit against the reduced backing to
+   acquire a larger share of the supply.
+4. Reveal/recover the hidden alpha, or have a later registry update and settlement
+   count it. The new shares now participate in that recovery.
+
+For hidden principal `H` with no growth, the original holders' aggregate loss
+from this ordering is bounded by `H`: it reallocates the late recovery, rather
+than also extracting another `H` from located backing. Emissions or surplus on
+the hidden key can make the later windfall exceed the `BackingWrittenOff` amount.
+Deposits stay shut between the write-off and the next registry update, so the
+quorum attesters or Basic owner decide when step 3 becomes possible.
+
+This is accepted policy and a reason to park before write-off. Afterward,
+neither `recoverStray` nor a new registry update reconstructs the old holders' claims.
+Following a complete write-off, a zero-floor `unwrap` voluntarily burns worthless
+shares and gives up their claim on future recovery. A positive floor preserves
+them; accrued TAO survives either way.
+
+## Other accepted limits
+
+- Watcher-assisted recovery permits temporary exit failures, including with intact
+  backing. The contract does not skip required alpha-exit alignment to avoid them.
+- Stake minimums and rounding can require top-ups or combining shares. A full
+  TAO exit may discard sub-floor unsold residue.
+- Partial TAO exits can refund unsold alpha as shares; `minTaoOut` bounds the payout,
+  not the pool-price effect on remaining holders.
+- A mailbox deposit moved by a swap needs manual reclaim and redeposit if its
+  actual key is no longer listed in the registry.
+- A parked position earns no emissions until the registry authority publishes a new set.
+  Any validator in the set can force a parking event by renaming its key and
+  cutting the trail.
+- In `ValidatorRegistry`, signatures have no expiry; landing a replacement retires a competing old list.
+- Clone protection relies on the chain refusing coldkey swaps into existing
+  hotkeys and rejecting locked-alpha transfers by default. A public UID can be
+  front-run into a retry; a poisoned candidate never becomes backing.
+
+See [edge cases](edge-cases.md) for dissolution, transfer restrictions and minimums.

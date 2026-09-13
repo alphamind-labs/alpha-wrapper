@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
 import { ValidatorRegistry, MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
 import { AttestationHelper } from "./helpers/AttestationHelper.sol";
@@ -10,17 +10,17 @@ contract ValidatorRegistryGasTest is AttestationHelper {
     uint256 private constant NETUID2 = 2;
     uint256 private constant NETUID3 = 3;
 
-    /// @dev Three validators is the expected size; every entry is priced there and again at the
-    ///      64-validator ceiling, so a change that only shows up at full width cannot land unnoticed.
     uint256 private constant TYPICAL_VALIDATORS = 3;
 
-    /// @dev The recovered addresses ascend in this order, which is the order the registry demands.
+    /// @dev Fixture private keys are ordered by recovered address, not numeric value.
     uint256 private constant PK_LOW = 0xB0B;
     uint256 private constant PK_HIGH = 0xA11CE;
 
     ValidatorRegistry private registry;
 
     function setUp() public {
+        _etchStakingMock();
+
         address[] memory initialSigners = new address[](2);
         initialSigners[0] = vm.addr(PK_LOW);
         initialSigners[1] = vm.addr(PK_HIGH);
@@ -40,19 +40,16 @@ contract ValidatorRegistryGasTest is AttestationHelper {
         );
     }
 
-    /// @dev One batch covering `netuids`, each carrying `validatorCount` freshly derived hotkeys.
     function _submitBatch(uint256[] memory netuids, uint256 validatorCount) private {
         ValidatorRegistry.WeightAttestation[] memory attestations =
             new ValidatorRegistry.WeightAttestation[](netuids.length);
         bytes[][] memory signatures = new bytes[][](netuids.length);
 
         for (uint256 i; i < netuids.length; ++i) {
-            attestations[i] = _buildAttestation(
-                netuids[i],
-                _hotkeysFrom(string.concat("batch", vm.toString(netuids[i])), validatorCount),
-                _evenWeights(validatorCount),
-                registry.nonces(netuids[i]) + 1
-            );
+            bytes32[] memory hotkeys = _hotkeysFrom(string.concat("batch", vm.toString(netuids[i])), validatorCount);
+            _recordHotkeyOwners(hotkeys);
+            attestations[i] =
+                _buildAttestation(netuids[i], hotkeys, _evenWeights(validatorCount), registry.nonces(netuids[i]) + 1);
             signatures[i] = _sign(_attestationDigest(registry, attestations[i]), _thresholdPks());
         }
 
@@ -71,7 +68,6 @@ contract ValidatorRegistryGasTest is AttestationHelper {
         vm.snapshotGasLastCall("ValidatorRegistry", "updateValidators: first commit");
     }
 
-    // The steady-state cost: the subnet already has a set and every slot is overwritten.
     function test_gas_updateValidators_fullRotation() public {
         _submit(NETUID1, "validator", TYPICAL_VALIDATORS);
 
@@ -84,7 +80,6 @@ contract ValidatorRegistryGasTest is AttestationHelper {
         vm.snapshotGasLastCall("ValidatorRegistry", "updateValidatorsBatch: three subnets");
     }
 
-    // The vault reads the set on every state-mutating call, so this price is paid protocol-wide.
     function test_gas_getValidators() public {
         _submit(NETUID1, "validator", TYPICAL_VALIDATORS);
 

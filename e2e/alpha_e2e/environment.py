@@ -5,11 +5,29 @@ bootstrap.build_environment() with typed on-chain getters (stakes, shares,
 prices, quotes) and scenario actions (vault sends, deposits, share transfers,
 validator rotations, revert assertions).
 """
+import secrets
+import re
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from . import chain, config, extrinsics, substrate, validators
+
+
+def largest_burn_leaving_alpha(total: int, supply: int) -> int:
+    """Largest burn that leaves both alpha and shares in the position."""
+    return min(supply - 1, (total * (supply + config.VIRTUAL_SHARES) - 1) // (total + config.VIRTUAL_ASSETS))
+
+
+def alpha_to_tao_quote(netuid: int, alpha_rao: int, block: Optional[int] = None) -> int:
+    """Chain's own alpha->TAO quote (RAO out) for selling `alpha_rao` on `netuid`, against
+    live reserves or those at `block`. Pin the block when pricing a swap that already ran:
+    the curve is concave, so a quote against post-swap reserves understates that swap's
+    payout by its own price impact."""
+    return int(chain.cast_call(
+        config.ALPHA_PRECOMPILE, "simSwapAlphaForTao(uint16,uint64)(uint256)",
+        netuid, alpha_rao, block=block,
+    ))
 
 
 def read_stake(hotkey_pubkey: str, coldkey_pubkey: str, netuid: int) -> int:
@@ -38,6 +56,11 @@ class Environment:
     observation_block_start: int
     registry_block_start: int
     registry_block_end: int
+    registry_type: str
+
+    @property
+    def uses_basic_registry(self) -> bool:
+        return self.registry_type == "basic"
 
     # --- On-chain getters -----------------------------------------------------
     def subnet_hotkey_pubkeys(self, subnet_index: int) -> List[str]:
@@ -59,11 +82,14 @@ class Environment:
             for hotkey_pubkey in hotkey_pubkeys
         )
 
-    def vault_shares(self, token_id: int, holder: Optional[str] = None) -> int:
-        """ERC1155 share balance of `holder` (default: the wrapper user)."""
+    def vault_shares(
+        self, token_id: int, holder: Optional[str] = None, block: Optional[int] = None,
+    ) -> int:
+        """ERC1155 share balance of `holder` (default: the wrapper user), live or as of
+        `block`."""
         return int(chain.cast_call(
             self.vault_address, "balanceOf(address,uint256)(uint256)",
-            holder or config.WRAPPER_USER_ADDRESS, token_id,
+            holder or config.WRAPPER_USER_ADDRESS, token_id, block=block,
         ))
 
     def vault_total_supply(self, token_id: int) -> int:
@@ -71,11 +97,11 @@ class Environment:
             self.vault_address, "totalSupply(uint256)(uint256)", token_id,
         ))
 
-    def vault_total_stake(self, token_id: int) -> int:
-        """Alpha (RAO) backing a token id, summed live across the validators the position
-        holds stake on."""
+    def vault_total_stake(self, token_id: int, block: Optional[int] = None) -> int:
+        """Alpha (RAO) backing a token id, summed across the validators the position holds
+        stake on, live or as of `block`."""
         return int(chain.cast_call(
-            self.lens_address, "totalStake(uint256)(uint256)", token_id,
+            self.lens_address, "totalStake(uint256)(uint256)", token_id, block=block,
         ))
 
     def vault_located_stake(self, token_id: int) -> int:
@@ -93,18 +119,35 @@ class Environment:
         ).strip() == "true"
 
     def frozen_until(self, token_id: int) -> int:
-        """Unix time at which the losses on file stop holding the token shut; 0 when none
-        is on file."""
+        """Write-off deadline of a declared shortfall; max uint256 while a shortfall is
+        undeclared, 0 while backing is intact. Expiry lets syncBacking write the deficit
+        off; it does not reopen the token by itself."""
         return int(chain.cast_call(
             self.lens_address, "frozenUntil(uint256)(uint256)", token_id,
         ))
 
     def sync_backing(self, token_id: int, label: Optional[str] = None) -> None:
-        """Put `token_id`'s unaccounted loss on file, starting the window after which the
-        record gives up on it. Anyone may call it."""
+        """Secure located backing and start, collect into, or finalize a fixed recovery window."""
         self.vault_send(
-            1_500_000, "syncBacking failed", "syncBacking(uint256)", token_id, label=label,
+            4_000_000, "syncBacking failed", "syncBacking(uint256)", token_id, label=label,
         )
+
+    def recover_stray(self, token_id: int, source_pubkey: str, message: str) -> dict:
+        """Collect one source; sync must declare any shortfall first."""
+        return self.vault_send(
+            4_000_000, message, "recoverStray(uint256,bytes32)", token_id, source_pubkey,
+            label="recoverStray",
+        )
+
+    def awaiting_attestation(self, token_id: int) -> bool:
+        """Whether the position rests on the parking hotkey with deposits and alignment shut
+        until the registry publishes a newer set."""
+        return chain.cast_call(
+            self.lens_address, "awaitingAttestation(uint256)(bool)", token_id,
+        ).strip() == "true"
+
+    def parking_hotkey(self) -> str:
+        return chain.cast_call(self.vault_address, "parkingHotkey()(bytes32)")
 
     def share_price(self, token_id: int) -> int:
         return int(chain.cast_call(
@@ -112,8 +155,7 @@ class Environment:
         ))
 
     def mailbox_address(self, netuid: int, user: Optional[str] = None) -> str:
-        """Deterministic mailbox deposit address for `user` (default: the wrapper
-        user) on a subnet."""
+        """Accepted mailbox address for `user`; zero until explicit preparation."""
         return chain.cast_call(
             self.vault_address, "getDepositAddress(address,uint256)(address)",
             user or config.WRAPPER_USER_ADDRESS, netuid,
@@ -130,6 +172,22 @@ class Environment:
         its on-chain stake."""
         return substrate.h160_to_substrate_b32(self.clone_address(token_id))
 
+    def preview_wrap(self, token_id: int, assets: int) -> int:
+        """Shares a deposit of `assets` alpha would mint, the quote a caller sizes
+        their `minSharesOut` from."""
+        return int(chain.cast_call(
+            self.lens_address, "previewWrap(uint256,uint256)(uint256)", token_id, assets,
+        ))
+
+    def recorded_slot_index(self, token_id: int, hotkey_pubkey: str) -> int:
+        """Index of the recorded slot whose active key is `hotkey_pubkey`; bit `index` of a
+        TAO exit's mask names it."""
+        printout = chain.cast_call_raw(
+            self.vault_address, "recordedSlots(uint256)((bytes32,bytes32,uint256)[])", token_id,
+        )
+        actives = re.findall(r"0x[0-9a-fA-F]{64}", printout)[1::2]
+        return [key.lower() for key in actives].index(hotkey_pubkey.lower())
+
     def preview_unwrap(self, token_id: int, shares: int) -> Tuple[int, int]:
         """(alpha RAO, native-TAO wei) legs an unwrap of `shares` would pay out."""
         lines = chain.cast_call_lines(
@@ -139,7 +197,7 @@ class Environment:
         return int(lines[0]), int(lines[1])
 
     def chain_min_stake_tao(self) -> int:
-        """The minimum the vault reads on every floor check. A runtime constant."""
+        """The minimum exposed by the staking precompile."""
         return int(chain.cast_call(config.STAKING_PRECOMPILE, "getDefaultMinStake()(uint256)"))
 
     def hotkey_in_last_seen(self, token_id: int, hotkey_pubkey: str) -> bool:
@@ -160,6 +218,19 @@ class Environment:
         """Alpha sitting in a subnet's pool (RAO), the chain's liquidity bound for swaps."""
         return int(chain.cast_call(
             config.ALPHA_PRECOMPILE, "getAlphaInPool(uint16)(uint64)", netuid,
+        ))
+
+    def tao_quote(self, netuid: int, alpha_rao: int) -> Optional[int]:
+        """The pool's quote for selling `alpha_rao`, or None when it refuses; free through eth_call."""
+        return chain.quote_alpha_for_tao(netuid, alpha_rao)
+
+    def current_token_id(self, netuid: int) -> int:
+        return int(chain.cast_call(self.vault_address, "currentTokenId(uint256)(uint256)", netuid))
+
+    def registration_counter(self, netuid: int) -> int:
+        """How many times the chain has registered the netuid."""
+        return int(chain.cast_call(
+            config.SUBNET_PRECOMPILE, "getRegisteredSubnetCounter(uint16)(uint64)", netuid,
         ))
 
     def is_subnet_dissolving(self, netuid: int) -> Optional[bool]:
@@ -191,25 +262,20 @@ class Environment:
 
     def alpha_value_tao(self, netuid: int, alpha_rao: int) -> int:
         """Spot TAO value (RAO) of an alpha amount at the current oracle price."""
-        return alpha_rao * self.alpha_price(netuid) // 10**18
+        return alpha_rao * self.alpha_price(netuid) // config.ALPHA_PRICE_SCALE
 
     def floor_boundary(self, netuid: int, floor_rao: int) -> Tuple[int, int]:
         """(alpha price, boundary): the smallest alpha-RAO deposit whose TAO value
         clears `floor_rao` at the current price."""
         price = self.alpha_price(netuid)
         assert price != 0, f"netuid {netuid}: alpha price reads 0 (oracle unavailable)"
-        boundary = (floor_rao * 10**18 + price - 1) // price
+        boundary = (floor_rao * config.ALPHA_PRICE_SCALE + price - 1) // price
         return price, boundary
 
     def alpha_to_tao_quote(self, netuid: int, alpha_rao: int) -> int:
-        """Chain's own alpha->TAO quote (RAO out) for selling `alpha_rao` on `netuid`.
-        Capture it BEFORE the swap that pays out: the simulation re-prices against
-        live reserves and the curve is concave, so a quote taken after the swap
-        understates the payout by its own price impact."""
-        return int(chain.cast_call(
-            config.ALPHA_PRECOMPILE, "simSwapAlphaForTao(uint16,uint64)(uint256)",
-            netuid, alpha_rao,
-        ))
+        """Chain's own alpha->TAO quote (RAO out) for selling `alpha_rao` on `netuid`
+        against live reserves."""
+        return alpha_to_tao_quote(netuid, alpha_rao)
 
     def holder_assets(self, token_id: int, holder: str) -> int:
         """A holder's pro-rata alpha backing (RAO)."""
@@ -237,8 +303,7 @@ class Environment:
         self, gas_limit: int, signature: str, *args,
         private_key: Optional[str] = None, label: Optional[str] = None,
     ) -> dict:
-        """Broadcast a vault transaction and return its receipt (a failed send
-        surfaces as a receipt without a success status). Every call reports its gas
+        """Broadcast a vault transaction and return its mined receipt. Every call reports its gas
         under `label`, defaulting to the function name being called."""
         receipt = chain.cast_send(
             self.vault_address, signature, *args,
@@ -264,13 +329,12 @@ class Environment:
         self, gas_limit: int, message: str, signature: str, *args,
         private_key: Optional[str] = None, label: Optional[str] = None,
     ) -> dict:
-        """Broadcast a vault transaction that is EXPECTED to revert; assert it did
-        not succeed."""
+        """Broadcast a vault transaction and require a mined EVM revert."""
         receipt = self.vault_broadcast(
             gas_limit, signature, *args,
             private_key=private_key, label=self._gas_label(signature, message, label),
         )
-        assert not chain.receipt_ok(receipt), message
+        assert receipt.get("status") == "0x0", f"{message}: {receipt}"
         return receipt
 
     def assert_vault_reverts_with(
@@ -299,7 +363,7 @@ class Environment:
             gas_limit, signature, *args,
             private_key=private_key, label=self._gas_label(signature, message, label),
         )
-        assert not chain.receipt_ok(receipt), message
+        assert receipt.get("status") == "0x0", f"{message}: {receipt}"
         return receipt
 
     # --- Scenario actions -------------------------------------------------------
@@ -319,25 +383,46 @@ class Environment:
         self, netuid: int, hotkey_pubkey: str, hotkey_ss58: str,
         amount_rao: int, gas_limit: int, message: str,
         user: Optional[str] = None, private_key: Optional[str] = None,
-        label: Optional[str] = None,
+        label: Optional[str] = None, min_shares_out: int = 0,
     ) -> dict:
         """Transfer alpha from Alice into a user's mailbox under a hotkey, then
         wrap it into the vault. Defaults to the wrapper user; pass `user` and
         `private_key` to run it for another holder. Returns the wrap receipt."""
         user = user or config.WRAPPER_USER_ADDRESS
         mailbox = self.mailbox_address(netuid, user)
+        clone = self.clone_address(self.current_token_id(netuid))
+        if int(mailbox, 16) == 0 or int(clone, 16) == 0:
+            self.vault_send(
+                2_000_000, "mailbox preparation failed", "createMailbox(uint256,bytes32)",
+                netuid, "0x" + secrets.token_hex(32),
+                private_key=private_key or config.WRAPPER_USER_PRIVATE_KEY,
+            )
+            mailbox = self.mailbox_address(netuid, user)
+            assert int(mailbox, 16) != 0, "preparation did not create the intended user's mailbox"
         print(f"  Transferring {amount_rao} RAO from Alice -> mailbox under {hotkey_pubkey[:18]}...")
         extrinsics.transfer_stake(
             substrate.h160_to_ss58(mailbox), hotkey_ss58, netuid, amount_rao,
         )
         return self.vault_send(
-            gas_limit, message, "wrap(uint256,bytes32)", netuid, hotkey_pubkey,
+            gas_limit, message, "wrap(uint256,bytes32,uint256)", netuid, hotkey_pubkey, min_shares_out,
             private_key=private_key or config.WRAPPER_USER_PRIVATE_KEY, label=label,
         )
 
-    def set_validators(self, netuid: int, hotkey_pubkeys: List[str], weights: List[int]) -> None:
-        """Rotate the registry's validator set for `netuid` via a real 2-of-2
-        EIP-712 attestation."""
+    def set_validators(
+        self, netuid: int, hotkey_pubkeys: List[str], weights: List[int], *, basic_hotkey: Optional[str] = None,
+    ) -> None:
+        """Publish a set, with an explicit sole target for compatible Basic variants.
+
+        Reject an implicit conversion: the scenario must choose the
+        single target that preserves its rotation or recovery setup.
+        """
+        if self.uses_basic_registry:
+            if basic_hotkey is None:
+                raise ValueError("Basic scenario must explicitly select one validator")
+            if basic_hotkey not in hotkey_pubkeys:
+                raise ValueError("Basic target must belong to the requested validator set")
+            validators.set_basic_validator(self.validator_registry_address, netuid, basic_hotkey)
+            return
         validators.set_validators(
             self.validator_registry_address,
             [config.DEPLOYER_PRIVATE_KEY, config.WRAPPER_USER_PRIVATE_KEY],

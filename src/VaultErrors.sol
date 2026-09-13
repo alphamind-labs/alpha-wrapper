@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-/// @dev The failure vocabulary of the alpha vault, declared once at file level so the vault, the
-///      lens that quotes it, and the libraries they share all fail with the same selector.
+pragma solidity 0.8.36;
 
 error ZeroAmount();
 error ZeroAddress();
@@ -16,24 +13,35 @@ error SubnetInDissolutionBlackoutPeriod();
 error SubnetDissolved();
 error NothingToUnwrap();
 error NoSharesOutstanding();
-error DepositTooSmall();
+/// @dev Positive backing below share-price precision; use `previewUnwrap` for a larger burn.
+error SharePriceBelowPrecision();
+/// @dev The mailbox holds conviction-locked alpha; reclaim it to a coldkey that accepts locks.
+error LockedDeposit();
+error MailboxNotPrepared();
+error SubnetCloneNotPrepared();
+error LockedBacking();
 error WithdrawTooSmall();
 error ClaimBelowNativePrecision();
 error SupplyCapExceeded();
 error NetuidOutOfRange();
 error ChosenHotkeyNotInSet();
 error SlippageExceeded(uint256 amountOut);
-error ConsolidationBelowFloor();
-error GatherBelowFloor();
-/// @dev The vault cannot account for backing a slot is owed; `tracked` is what the named key was
-///      expected to hold. Clears when the alpha is found or the loss is written off.
+/// @dev Located backing falls short of the recorded expectation, allowing for accounting dust.
 error BackingShortfall(uint16 netuid, bytes32 hotkey, uint256 tracked);
+/// @dev A declared shortfall holds priced operations shut until recovery completes or sync writes it off.
+error ShortfallOnFile();
 error BackingUnchanged();
 error NothingToRecover();
-error RecoveryBelowFloor();
-/// @dev The chain moves stake entries whole, so a slot's loss sits under one key; a source that
-///      cannot cover the whole expectation is not where the backing went.
-error RecoveryIncomplete();
-/// @dev The attested set lists a swapped-away hotkey beside its successor; the vault cannot
-///      serve it until the attesters drop the old name.
-error SwappedHotkeyStillAttested();
+/// @dev The subnet owner disabled alpha transfers; TAO exits and TAO mailbox reclaims still work.
+error AlphaTransfersDisabled(uint16 netuid);
+/// @dev A bit of the exclusion mask names a slot the record does not have.
+error SlotMaskOutOfRange();
+/// @dev Located backing remains exposed after collection; the recovery clock must not start.
+error BackingNotSecured();
+/// @dev The position rests on the parking hotkey until the registry publishes a newer set.
+error Parked();
+/// @dev The parking hotkey already belongs to another coldkey; deploy with an unused one.
+error ParkingHotkeyUnavailable();
+/// @dev No owned receiving key was resolved for this attested name.
+///      Restore an owner record or replace the registry entry; the backing timer cannot fix ownership.
+error AttestedHotkeyRetired(bytes32 hotkey);

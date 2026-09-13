@@ -1,10 +1,27 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
+import { VaultMath } from "src/libraries/VaultMath.sol";
 import { Test } from "forge-std/Test.sol";
 import { ValidatorRegistry } from "src/ValidatorRegistry.sol";
+import { MockStaking } from "../mocks/MockStaking.sol";
+import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
 
 abstract contract AttestationHelper is Test {
+    function _etchStakingMock() internal {
+        vm.etch(STAKING_PRECOMPILE, address(new MockStaking()).code);
+    }
+
+    function _recordHotkeyOwner(bytes32 hotkey) internal {
+        MockStaking(STAKING_PRECOMPILE).setHotkeyOwned(hotkey, true);
+    }
+
+    function _recordHotkeyOwners(bytes32[] memory hotkeys) internal {
+        for (uint256 i; i < hotkeys.length; ++i) {
+            _recordHotkeyOwner(hotkeys[i]);
+        }
+    }
+
     function _domainSeparator(ValidatorRegistry registry) internal view returns (bytes32) {
         (, string memory name, string memory version, uint256 chainId, address verifyingContract,,) =
             registry.eip712Domain();
@@ -36,8 +53,7 @@ abstract contract AttestationHelper is Test {
         return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(registry), structHash));
     }
 
-    /// @dev `pks` must be ordered such that the recovered addresses ascend (the contract
-    ///      enforces this in `_verifySignatures`).
+    /// @dev Order private keys by recovered address, not numeric value.
     function _sign(bytes32 digest, uint256[] memory pks) internal pure returns (bytes[] memory sigs) {
         sigs = new bytes[](pks.length);
         for (uint256 i = 0; i < pks.length; i++) {
@@ -46,8 +62,7 @@ abstract contract AttestationHelper is Test {
         }
     }
 
-    /// @dev `count` distinct hotkeys derived from `salt`. Distinct salts give disjoint sets, which
-    ///      is how a test rotates a whole validator set out at once.
+    /// @dev Different salts give disjoint sets for full-rotation fixtures.
     function _hotkeysFrom(string memory salt, uint256 count) internal pure returns (bytes32[] memory hotkeys) {
         hotkeys = new bytes32[](count);
         for (uint256 i; i < count; ++i) {
@@ -55,22 +70,17 @@ abstract contract AttestationHelper is Test {
         }
     }
 
-    /// @dev Even split with the rounding remainder on the last slot, matching how the vault assigns
-    ///      targets.
     function _evenWeights(uint256 count) internal pure returns (uint16[] memory weights) {
         weights = new uint16[](count);
-        // A validator set holds at most 64 entries, so the count fits uint16 and every share it
-        // divides 10000 into is smaller still.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint16 slots = uint16(count);
-        uint16 share = 10_000 / slots;
+        uint16 share = VaultMath.BPS_BASE / slots;
         for (uint16 i; i + 1 < slots; ++i) {
             weights[i] = share;
         }
-        weights[slots - 1] = 10_000 - share * (slots - 1);
+        weights[slots - 1] = VaultMath.BPS_BASE - share * (slots - 1);
     }
 
-    /// @dev Builds the payload, widening the weights to the attestation's on-wire uint256 type.
     function _buildAttestation(uint256 netuid, bytes32[] memory hotkeys, uint16[] memory weights, uint256 nonce)
         internal
         pure
@@ -83,6 +93,7 @@ abstract contract AttestationHelper is Test {
         att = ValidatorRegistry.WeightAttestation({ netuid: netuid, hotkeys: hotkeys, weights: wts, nonce: nonce });
     }
 
+    /// @dev Seed owner records without resurrecting keys explicitly deleted by the test.
     function _submitAttestation(
         ValidatorRegistry registry,
         uint256 netuid,
@@ -90,6 +101,7 @@ abstract contract AttestationHelper is Test {
         uint16[] memory weights,
         uint256[] memory signerPks
     ) internal {
+        _recordHotkeyOwners(hotkeys);
         ValidatorRegistry.WeightAttestation memory att =
             _buildAttestation(netuid, hotkeys, weights, registry.nonces(netuid) + 1);
         bytes32 digest = _attestationDigest(registry, att);

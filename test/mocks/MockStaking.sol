@@ -1,32 +1,28 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
+import { VaultMath } from "src/libraries/VaultMath.sol";
 import { MockAlpha } from "./MockAlpha.sol";
 import { ALPHA_PRECOMPILE } from "src/interfaces/IAlpha.sol";
 
-/// @dev The simulated chain's minimum for unstaking. `vm.etch` copies only code, so every suite
-///      that etches this mock must seed both minimums - an unseeded zero silently accepts amounts
-///      the chain would reject.
+/// @dev Fixtures must seed minimums after `vm.etch`, which copies code but not storage.
 uint256 constant CHAIN_MIN_STAKE = 2e6;
 
-/// @dev The simulated chain's minimum for shifting stake inside a subnet, twenty times lower than
-///      the unstake minimum above. Apart, they let a test tell the vault's refusals from the chain's.
 uint256 constant CHAIN_MIN_TRANSFER = 1e5;
 
-/// @dev The simulated chain's nominator dust threshold; aliased by the test base the same way.
 uint256 constant CHAIN_NOMINATOR_MIN_STAKE = 20e6;
 
-/// @dev Uses keccak256("evm:", h160) for coldkey derivation instead of the real
-///      blake2b, matching the test helper `_toSubstrate`.
+/// @dev Uses keccak256, not Frontier's blake2b; amounts are simplified for unit tests.
 contract MockStaking {
     mapping(bytes32 => mapping(bytes32 => mapping(uint256 => uint256))) public stakes;
     uint256 public moveStakeRoundingLoss;
+    uint256 public moveStakeResidual;
+    uint256 public transferStakeRoundingLoss;
     bool public transferStakeReverts;
     bool public consumeAllGasOnFailure;
-    /// @dev Floors the unstake rail, and the only minimum the chain exposes a getter for.
+    bool public nativeTaoUnits;
     uint256 private _chainMinStakeTao;
 
-    /// @dev Floors moves and transfers within a subnet.
     uint256 private _chainMinTransferTao;
 
     function setTransferStakeReverts(bool v) external {
@@ -37,9 +33,12 @@ contract MockStaking {
         consumeAllGasOnFailure = v;
     }
 
-    // The real staking precompile surfaces a rejected dispatch as an EVM error, which consumes all
-    // gas forwarded to its frame; a plain revert refunds it. Opt in when a test must observe the
-    // gas consequences of a rejected call.
+    /// @dev Enable the precompile's RAO-to-EVM conversion without changing the quote's RAO units.
+    function setNativeTaoUnits(bool enabled) external {
+        nativeTaoUnits = enabled;
+    }
+
+    // Real precompile rejection consumes forwarded gas; plain Solidity revert would refund it.
     function _fail(string memory reason) private view {
         if (consumeAllGasOnFailure) {
             assembly {
@@ -49,7 +48,11 @@ contract MockStaking {
         revert(reason);
     }
 
+    /// @dev Alpha per (coldkey, netuid) across hotkeys, the total the chain's lock checks read.
+    mapping(bytes32 => mapping(uint256 => uint256)) public coldkeyAlpha;
+
     function setStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid, uint256 amount) external {
+        coldkeyAlpha[coldkey][netuid] = coldkeyAlpha[coldkey][netuid] + amount - stakes[hotkey][coldkey][netuid];
         stakes[hotkey][coldkey][netuid] = amount;
     }
 
@@ -57,14 +60,11 @@ contract MockStaking {
         return keccak256(abi.encodePacked("evm:", msg.sender));
     }
 
-    // Thresholds are tao-denominated: the chain values alpha at the chain-side (full-precision)
-    // price, which is unaffected by the EVM getAlphaPrice quantization, so a sub-1e-9 subnet whose
-    // EVM price reads 0 still has binding chain thresholds. Price is scaled 1e18 to match the
-    // precompile.
+    // Chain minimums use full-precision prices even when the EVM reader rounds to zero.
     function _belowTaoValue(uint256 amount, uint256 netuid, uint256 thresholdTao) private view returns (bool) {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 alphaPriceE18 = MockAlpha(ALPHA_PRECOMPILE).chainAlphaPrice(uint16(netuid));
-        return (amount * alphaPriceE18) / 1e18 < thresholdTao;
+        return (amount * alphaPriceE18) / VaultMath.ALPHA_PRICE_SCALE < thresholdTao;
     }
 
     function setChainMinStake(uint256 minStakeTao) external {
@@ -83,6 +83,55 @@ contract MockStaking {
         return _belowTaoValue(amount, netuid, _chainMinTransferTao);
     }
 
+    // --- Conviction locks -------------------------------------------------------------------------
+    // The chain keys a lock by hotkey as well; only the coldkey-wide locked mass matters to the vault.
+
+    /// @dev Locked mass per (coldkey, netuid) in alpha RAO, and the one hotkey the chain keys it to.
+    mapping(bytes32 => mapping(uint256 => uint256)) public lockedAlpha;
+    mapping(bytes32 => mapping(uint256 => bytes32)) public lockHotkey;
+    mapping(bytes32 => bool) private _acceptsLockedAlpha;
+    mapping(bytes32 => uint256) public rejectLockedAlphaCalls;
+
+    function setLockedAlpha(bytes32 coldkey, uint256 netuid, bytes32 hotkey, uint256 amount) external {
+        lockedAlpha[coldkey][netuid] = amount;
+        lockHotkey[coldkey][netuid] = amount == 0 ? bytes32(0) : hotkey;
+    }
+
+    /// @dev Models the flag a coldkey swap copies onto an account with no stake.
+    function setAcceptsLockedAlpha(bytes32 coldkey, bool accepts) external {
+        _acceptsLockedAlpha[coldkey] = accepts;
+    }
+
+    function getRejectLockedAlpha(bytes32 coldkey) external view returns (bool) {
+        return !_acceptsLockedAlpha[coldkey];
+    }
+
+    function getColdkeyLock(bytes32 coldkey, uint256 netuid)
+        external
+        view
+        returns (bool exists, bytes32 hotkey, uint256 locked, uint128 conviction, bool perpetual)
+    {
+        locked = lockedAlpha[coldkey][netuid];
+        return (locked != 0, lockHotkey[coldkey][netuid], locked, conviction, perpetual);
+    }
+
+    function setRejectLockedAlpha(bool enabled) external payable {
+        bytes32 coldkey = _senderColdkey();
+        _acceptsLockedAlpha[coldkey] = !enabled;
+        rejectLockedAlphaCalls[coldkey]++;
+    }
+
+    /// @dev Unlocked alpha leaves first; whatever a transfer takes beyond it carries the lock along.
+    function _carriedLock(bytes32 coldkey, uint256 netuid, uint256 amount) private view returns (uint256) {
+        uint256 locked = lockedAlpha[coldkey][netuid];
+        if (locked == 0) return 0;
+        uint256 total = coldkeyAlpha[coldkey][netuid];
+        uint256 available = total > locked ? total - locked : 0;
+        if (amount <= available) return 0;
+        uint256 excess = amount - available;
+        return excess > locked ? locked : excess;
+    }
+
     function transferStake(
         bytes32 destination_coldkey,
         bytes32 hotkey,
@@ -93,18 +142,45 @@ contract MockStaking {
         if (transferStakeReverts) {
             _fail("MockStaking: transferStake reverted");
         }
-        if (hotkeyDeleted[hotkey]) {
+        if (!_hasOwnerRecord(hotkey)) {
             _fail("MockStaking: hotkey has no owner");
         }
         if (_belowMinTransfer(amount, origin_netuid)) {
             _fail("MockStaking: AmountTooLow");
         }
-        stakes[hotkey][_senderColdkey()][origin_netuid] -= amount;
-        stakes[hotkey][destination_coldkey][destination_netuid] += amount;
+        bytes32 origin = _senderColdkey();
+        uint256 carriedLock = _carriedLock(origin, origin_netuid, amount);
+        if (carriedLock != 0) {
+            if (!_acceptsLockedAlpha[destination_coldkey]) {
+                _fail("MockStaking: AccountRejectsLockedAlpha");
+            }
+            bytes32 destinationLockHotkey = lockHotkey[destination_coldkey][destination_netuid];
+            if (destinationLockHotkey != bytes32(0) && destinationLockHotkey != hotkey) {
+                _fail("MockStaking: LockHotkeyMismatch");
+            }
+            lockedAlpha[origin][origin_netuid] -= carriedLock;
+            if (lockedAlpha[origin][origin_netuid] == 0) lockHotkey[origin][origin_netuid] = bytes32(0);
+            lockHotkey[destination_coldkey][destination_netuid] = hotkey;
+            lockedAlpha[destination_coldkey][destination_netuid] += carriedLock;
+        }
+        stakes[hotkey][origin][origin_netuid] -= amount;
+        coldkeyAlpha[origin][origin_netuid] -= amount;
+        uint256 credited = amount > transferStakeRoundingLoss ? amount - transferStakeRoundingLoss : 0;
+        stakes[hotkey][destination_coldkey][destination_netuid] += credited;
+        coldkeyAlpha[destination_coldkey][destination_netuid] += credited;
+    }
+
+    function setTransferStakeRoundingLoss(uint256 loss) external {
+        transferStakeRoundingLoss = loss;
     }
 
     function setMoveStakeRoundingLoss(uint256 loss) external {
         moveStakeRoundingLoss = loss;
+    }
+
+    /// @dev Fault injection: leave alpha at the source despite a successful move call.
+    function setMoveStakeResidual(uint256 residual) external {
+        moveStakeResidual = residual;
     }
 
     bool public moveStakeReverts;
@@ -123,27 +199,152 @@ contract MockStaking {
         if (moveStakeReverts) {
             _fail("MockStaking: moveStake reverted");
         }
-        if (hotkeyDeleted[origin_hotkey] || hotkeyDeleted[destination_hotkey]) {
+        if (!_hasOwnerRecord(origin_hotkey) || !_hasOwnerRecord(destination_hotkey)) {
             _fail("MockStaking: hotkey has no owner");
         }
         if (_belowMinTransfer(amount, origin_netuid)) {
             _fail("MockStaking: AmountTooLow");
         }
-        stakes[origin_hotkey][_senderColdkey()][origin_netuid] -= amount;
-        stakes[destination_hotkey][_senderColdkey()][destination_netuid] += amount - moveStakeRoundingLoss;
+        uint256 moved = amount > moveStakeResidual ? amount - moveStakeResidual : 0;
+        stakes[origin_hotkey][_senderColdkey()][origin_netuid] -= moved;
+        coldkeyAlpha[_senderColdkey()][origin_netuid] -= moved;
+        stakes[destination_hotkey][_senderColdkey()][destination_netuid] += moved - moveStakeRoundingLoss;
+        coldkeyAlpha[_senderColdkey()][destination_netuid] += moved - moveStakeRoundingLoss;
     }
 
     function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid) external view returns (uint256) {
         return stakes[hotkey][coldkey][netuid];
     }
 
-    /// @dev A swap that keeps its stake leaves the old key with no recorded owner, after which the
-    ///      chain rejects every stake operation naming it - move origin, move destination, transfer
-    ///      source or unstake source alike.
+    /// @dev Models a missing owner record, not deletion of the hotkey identifier or its stake.
     mapping(bytes32 => bool) public hotkeyDeleted;
 
+    /// @dev The chain drops a hotkey from its owner's index when the record goes, and a restored
+    ///      record rejoins the index of the owner it answers with.
     function setHotkeyDeleted(bytes32 hotkey, bool deleted) external {
         hotkeyDeleted[hotkey] = deleted;
+        if (deleted) {
+            _dropOwnedHotkey(hotkey);
+        } else if (_hotkeyOwned[hotkey]) {
+            _indexOwnedHotkey(ownerOf(hotkey), hotkey);
+        }
+    }
+
+    /// @dev Seed owner presence separately from balances so tests can model ownerless stake.
+    ///      A hotkey without an explicit owner is owned by a coldkey derived from its own name.
+    mapping(bytes32 => bool) private _hotkeyOwned;
+    mapping(bytes32 => bytes32) private _hotkeyOwner;
+
+    function setHotkeyOwned(bytes32 hotkey, bool owned) external {
+        if (owned) {
+            _assignOwner(hotkey, ownerOf(hotkey));
+        } else {
+            _hotkeyOwned[hotkey] = false;
+            _dropOwnedHotkey(hotkey);
+        }
+    }
+
+    function setHotkeyOwner(bytes32 hotkey, bytes32 coldkey) external {
+        _assignOwner(hotkey, coldkey);
+    }
+
+    /// @dev The one path that writes ownership, so the owner a hotkey answers with and the index of
+    ///      owned hotkeys never disagree: the previous index entry goes, and a new one is recorded only
+    ///      while the record is not deleted, since reseeding never restores a deleted record.
+    function _assignOwner(bytes32 hotkey, bytes32 coldkey) private {
+        _dropOwnedHotkey(hotkey);
+        _hotkeyOwned[hotkey] = true;
+        _hotkeyOwner[hotkey] = coldkey;
+        if (!hotkeyDeleted[hotkey]) _indexOwnedHotkey(coldkey, hotkey);
+    }
+
+    /// @dev Every stake operation the chain accepts touches hotkeys that have an owner record.
+    function _hasOwnerRecord(bytes32 hotkey) private view returns (bool) {
+        return _hotkeyOwned[hotkey] && !hotkeyDeleted[hotkey];
+    }
+
+    /// @dev The owner a hotkey answers with while it has one, ignoring a deleted record.
+    function ownerOf(bytes32 hotkey) public view returns (bytes32) {
+        bytes32 owner = _hotkeyOwner[hotkey];
+        return owner == bytes32(0) ? keccak256(abi.encodePacked("owner:", hotkey)) : owner;
+    }
+
+    /// @dev The neuron mock's association: an ownerless hotkey goes to `coldkey`; an owned one stays put.
+    function associate(bytes32 hotkey, bytes32 coldkey) external {
+        if (_hasOwnerRecord(hotkey)) return;
+        hotkeyDeleted[hotkey] = false;
+        _assignOwner(hotkey, coldkey);
+    }
+
+    function getHotkeyOwner(bytes32 hotkey) external view returns (bool, bytes32) {
+        bool exists = _hasOwnerRecord(hotkey);
+        return (exists, exists ? ownerOf(hotkey) : bytes32(0));
+    }
+
+    mapping(bytes32 => bytes32[]) private _ownedHotkeys;
+    /// @dev The index a hotkey currently sits in, so a change of owner can remove it from there.
+    mapping(bytes32 => bytes32) private _indexedUnder;
+    mapping(bytes32 => bytes32) private _coldkeyRoot;
+
+    function getOwnedHotkeys(bytes32 coldkey) external view returns (bytes32[] memory) {
+        return _ownedHotkeys[coldkey];
+    }
+
+    /// @dev The chain holds the owned hotkeys as a set.
+    function _indexOwnedHotkey(bytes32 coldkey, bytes32 hotkey) private {
+        _dropOwnedHotkey(hotkey);
+        _ownedHotkeys[coldkey].push(hotkey);
+        _indexedUnder[hotkey] = coldkey;
+    }
+
+    function _dropOwnedHotkey(bytes32 hotkey) private {
+        bytes32 coldkey = _indexedUnder[hotkey];
+        if (coldkey == bytes32(0)) return;
+        bytes32[] storage owned = _ownedHotkeys[coldkey];
+        for (uint256 i; i < owned.length; ++i) {
+            if (owned[i] == hotkey) {
+                owned[i] = owned[owned.length - 1];
+                owned.pop();
+                break;
+            }
+        }
+        delete _indexedUnder[hotkey];
+    }
+
+    function getColdkeyRoot(bytes32 coldkey) external view returns (bool, bytes32) {
+        return (_coldkeyRoot[coldkey] != bytes32(0), _coldkeyRoot[coldkey]);
+    }
+
+    function setColdkeyRoot(bytes32 coldkey, bytes32 root) external {
+        _coldkeyRoot[coldkey] = root;
+    }
+
+    /// @dev An incoming coldkey swap narrowed to one subnet. It models the rules a swap runs against the
+    ///      destination: the destination is refused when it is itself a hotkey, and refused when it already
+    ///      holds stake, which the chain tests across all subnets and this fixture tests on `netuid`. On a
+    ///      swap the source's stake, owned hotkeys, locks and accept-locked flag all land on the destination.
+    function simulateColdkeySwap(bytes32 source, bytes32 destination, uint256 netuid, bytes32[] calldata hotkeys)
+        external
+    {
+        require(!_hasOwnerRecord(destination), "MockStaking: NewColdKeyIsHotkey");
+        require(coldkeyAlpha[destination][netuid] == 0, "MockStaking: ColdKeyAlreadyAssociated");
+        for (uint256 i; i < hotkeys.length; ++i) {
+            uint256 amount = stakes[hotkeys[i]][source][netuid];
+            stakes[hotkeys[i]][source][netuid] = 0;
+            stakes[hotkeys[i]][destination][netuid] += amount;
+            coldkeyAlpha[source][netuid] -= amount;
+            coldkeyAlpha[destination][netuid] += amount;
+        }
+        lockedAlpha[destination][netuid] = lockedAlpha[source][netuid];
+        lockHotkey[destination][netuid] = lockHotkey[source][netuid];
+        delete lockedAlpha[source][netuid];
+        delete lockHotkey[source][netuid];
+        _acceptsLockedAlpha[destination] = _acceptsLockedAlpha[source];
+        _coldkeyRoot[destination] = source;
+        bytes32[] memory sourceHotkeys = _ownedHotkeys[source];
+        for (uint256 i; i < sourceHotkeys.length; ++i) {
+            _assignOwner(sourceHotkeys[i], destination);
+        }
     }
 
     mapping(bytes32 => mapping(uint256 => bytes32)) private _successor;
@@ -154,7 +355,11 @@ contract MockStaking {
         _successorSet[from][netuid] = true;
     }
 
-    /// @dev The mock never folds an absent entry to self; the caller does, matching the chain.
+    function clearHotkeySuccessor(bytes32 hotkey, uint256 netuid) external {
+        delete _successor[hotkey][netuid];
+        delete _successorSet[hotkey][netuid];
+    }
+
     function getHotkeySuccessor(bytes32 hotkey, uint16 netuid) external view returns (bool, bytes32) {
         return (_successorSet[hotkey][netuid], _successor[hotkey][netuid]);
     }
@@ -164,7 +369,7 @@ contract MockStaking {
     bool public removeStakeReverts;
     mapping(bytes32 => bool) public removeStakeRevertsFor;
     uint256 public nominatorMinRequiredStake;
-    /// @dev Most alpha one unstake can swap before the pool hits its price floor; 0 is uncapped.
+    /// @dev Zero means uncapped.
     uint256 public removeStakeCap;
 
     function setNominatorMinRequiredStake(uint256 thresholdTao) external {
@@ -180,8 +385,6 @@ contract MockStaking {
         taoPerAlphaDenom = denom;
     }
 
-    /// @notice The one payout formula behind removeStake, the sweep, and the alpha mock's sim
-    ///         quotes, so they cannot drift apart.
     function quoteTaoOut(uint256 alpha) public view returns (uint256) {
         return (alpha * taoPerAlpha) / taoPerAlphaDenom;
     }
@@ -202,32 +405,33 @@ contract MockStaking {
         if (removeStakeReverts || removeStakeRevertsFor[hotkey]) {
             _fail("MockStaking: removeStake reverted");
         }
-        if (hotkeyDeleted[hotkey]) {
+        if (!_hasOwnerRecord(hotkey)) {
             _fail("MockStaking: hotkey has no owner");
         }
         uint256 staked = stakes[hotkey][_senderColdkey()][netuid];
-        // Unit seam: proceeds are credited 1:1 (rao as wei) for test readability; the real chain
-        // credits rao * 1e9 wei. Wei-denominated payouts are asserted by the e2e run.
-        // As on the chain, a capped swap leaves the rest of the request staked.
+        uint256 locked = lockedAlpha[_senderColdkey()][netuid];
+        uint256 total = coldkeyAlpha[_senderColdkey()][netuid];
+        if (alphaAmount > (total > locked ? total - locked : 0)) {
+            _fail("MockStaking: StakeUnavailable");
+        }
+        // Legacy arithmetic fixtures credit one wei per TAO RAO. Native-unit campaigns enable 1e9 below.
         uint256 consumed = removeStakeCap != 0 && alphaAmount > removeStakeCap ? removeStakeCap : alphaAmount;
         uint256 taoOut = quoteTaoOut(consumed);
-        // As on the chain, the floor binds only when stake remains, and is checked before the swap.
         if (alphaAmount != staked && quoteTaoOut(alphaAmount) < _chainMinStakeTao) {
             _fail("MockStaking: AmountTooLow");
         }
         uint256 remainder = staked - consumed;
-        // As on the chain, a remainder spot-valued below the nominator threshold is force-sold and
-        // credited to the unstaker within the same call; a zero threshold disables the sweep. The
-        // threshold gates first: standalone suites etch this mock alone, and only an armed sweep
-        // may reach the alpha mock's price.
+        // A dust remainder is force-sold into this payout; standalone fixtures may omit the alpha mock
+        // when the threshold is zero.
         if (remainder != 0 && nominatorMinRequiredStake != 0) {
             if (_belowTaoValue(remainder, netuid, nominatorMinRequiredStake)) {
                 taoOut += quoteTaoOut(remainder);
                 remainder = 0;
             }
         }
+        coldkeyAlpha[_senderColdkey()][netuid] -= staked - remainder;
         stakes[hotkey][_senderColdkey()][netuid] = remainder;
-        (bool ok,) = msg.sender.call{ value: taoOut }("");
+        (bool ok,) = msg.sender.call{ value: nativeTaoUnits ? taoOut * VaultMath.TAO_NATIVE_QUANTUM : taoOut }("");
         require(ok, "MockStaking: TAO credit failed");
     }
 }

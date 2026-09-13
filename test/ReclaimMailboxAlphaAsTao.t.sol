@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { NetuidOutOfRange, SlippageExceeded, ZeroAmount, ZeroHotkey } from "src/VaultErrors.sol";
@@ -9,12 +9,8 @@ import { RevertingReceiver, ReclaimMailboxReentrantReceiver } from "./helpers/Ta
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
-    event MailboxAlphaSoldForTao(
-        address indexed user, uint256 indexed netuid, bytes32 indexed hotkey, uint256 alpha, uint256 taoOut
-    );
-
     function _seedMailboxAlpha(address user, uint256 netuid, bytes32 hotkey, uint256 amount) internal {
-        address predicted = vault.getDepositAddress(user, netuid);
+        address predicted = _prepareMailbox(user, netuid);
         bytes32 ck = _toSubstrate(predicted);
         MockStaking(STAKING_PRECOMPILE).setStake(hotkey, ck, netuid, amount);
     }
@@ -67,6 +63,7 @@ contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
     }
 
     function test_RevertWhen_NoMailboxStakeForGivenHotkey() public {
+        _prepareMailbox(alice, NETUID1);
         vm.prank(alice);
         vm.expectRevert(ZeroAmount.selector);
         vault.reclaimMailboxAlphaAsTao(NETUID1, hotkey1, 0);
@@ -95,8 +92,6 @@ contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
         assertEq(MockStaking(STAKING_PRECOMPILE).getStake(hotkey1, _toSubstrate(predicted), NETUID1), 50 ether);
     }
 
-    // A native TAO gift sent directly to the mailbox must be excluded from the slippage delta
-    // and remain on the mailbox afterwards.
     function test_DonationToMailboxPriorToCall_DoesNotInflateTaoOut() public {
         _setRemoveStakeRate(1, 1);
         _seedMailboxAlpha(alice, NETUID1, hotkey1, 50 ether);
@@ -112,8 +107,6 @@ contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
         assertEq(mailbox.balance, 3 ether);
     }
 
-    // If the caller's receive hook reverts on the TAO payment, the whole call must roll back
-    // and leave mailbox alpha intact.
     function test_RevertWhen_CallerReceiverRevertsOnReceive() public {
         _setRemoveStakeRate(1, 1);
         RevertingReceiver receiver = new RevertingReceiver();
@@ -127,7 +120,6 @@ contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
         assertEq(MockStaking(STAKING_PRECOMPILE).getStake(hotkey1, _toSubstrate(predicted), NETUID1), 50 ether);
     }
 
-    // The reentrancy guard must reject a recipient whose receive hook tries to call back in.
     function test_ReentrantReclaimMailboxAlphaAsTaoIsRejectedByGuard() public {
         _setRemoveStakeRate(1, 1);
         ReclaimMailboxReentrantReceiver receiver = new ReclaimMailboxReentrantReceiver();
@@ -137,15 +129,12 @@ contract ReclaimMailboxAlphaAsTaoTest is AlphaVaultTestBase {
         vm.prank(address(receiver));
         vault.reclaimMailboxAlphaAsTao(NETUID1, hotkey1, 0);
 
-        // The re-entry was rejected specifically by the guard, not by some incidental revert.
         assertEq(receiver.reentryError(), abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector));
         assertFalse(receiver.reentrySucceeded());
-        // The legitimate (outer) reclaim still completed: the mailbox stake is drained.
         address predicted = vault.getDepositAddress(address(receiver), NETUID1);
         assertEq(MockStaking(STAKING_PRECOMPILE).getStake(hotkey1, _toSubstrate(predicted), NETUID1), 0);
     }
 
-    // Event payload must carry every field off-chain indexers rely on.
     function test_ReclaimMailboxAlphaAsTao_EmitsMailboxAlphaSoldForTaoEvent() public {
         _setRemoveStakeRate(1, 1);
         _seedMailboxAlpha(alice, NETUID1, hotkey1, 50 ether);

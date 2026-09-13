@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
 import { IStaking, STAKING_PRECOMPILE } from "../interfaces/IStaking.sol";
 import { IValidatorRegistry } from "../interfaces/IValidatorRegistry.sol";
@@ -9,31 +9,46 @@ import { VaultMath } from "./VaultMath.sol";
 import {
     BackingShortfall,
     NoValidatorFound,
+    AlphaTransfersDisabled,
     SubnetInDissolutionBlackoutPeriod,
     ValidatorSetMalformed
 } from "../VaultErrors.sol";
 
-/// @title VaultReads
-/// @notice The chain reads behind a vault position - validator set, per-hotkey stake, subnet
-///         registration state and unclaimed clone TAO - shared by `AlphaVault` and the read-only
-///         `AlphaVaultLens`, so a quote and the call it quotes read the same way.
-/// @dev    Vault storage is never reached from here; every caller passes in what it read from its
-///         own side, whether that is a storage slot or a getter call.
 library VaultReads {
+    uint256 internal constant NO_SHORT_SLOT = type(uint256).max;
+    /// @dev Frozen with no deadline until recovery is declared.
+    uint256 internal constant UNDECLARED_SHORTFALL = type(uint256).max;
+
     function coldkeyOf(address evmAddress) internal view returns (bytes32) {
         return IAddressMapping(ADDRESS_MAPPING_PRECOMPILE).addressMapping(evmAddress);
     }
 
-    /// @dev Reverts `NoValidatorFound` if the registry has no configured set for `netuid`.
+    function ownedBy(bytes32 hotkey, bytes32 coldkey) internal view returns (bool) {
+        (bool exists, bytes32 owner) = IStaking(STAKING_PRECOMPILE).getHotkeyOwner(hotkey);
+        return exists && owner == coldkey;
+    }
+
+    function lockedAlphaOf(bytes32 coldkey, uint16 netuid) internal view returns (uint256 lockedAlpha) {
+        (,, lockedAlpha,,) = IStaking(STAKING_PRECOMPILE).getColdkeyLock(coldkey, netuid);
+    }
+
+    /// @dev One attestation: the target hotkeys, their basis-point weights and the coldkey that owned
+    ///      each name when it was attested.
+    struct ValidatorSet {
+        bytes32[] hotkeys;
+        uint16[] weights;
+        bytes32[] owners;
+    }
+
     function resolveValidators(IValidatorRegistry registry, uint16 netuid)
         internal
         view
-        returns (bytes32[] memory hotkeys, uint16[] memory weights)
+        returns (ValidatorSet memory set)
     {
-        (hotkeys, weights) = registry.getValidators(netuid);
+        (bytes32[] memory hotkeys, uint16[] memory weights, bytes32[] memory owners) = registry.getValidators(netuid);
         if (hotkeys.length == 0) revert NoValidatorFound();
-        // The registry interface guarantees matching lengths; a broken registry fails fast here.
-        if (hotkeys.length != weights.length) revert ValidatorSetMalformed();
+        if (hotkeys.length != weights.length || hotkeys.length != owners.length) revert ValidatorSetMalformed();
+        set = ValidatorSet({ hotkeys: hotkeys, weights: weights, owners: owners });
     }
 
     function fetchBalances(bytes32[] memory hotkeys, bytes32 coldkey, uint16 netuid)
@@ -51,55 +66,58 @@ library VaultReads {
         }
     }
 
-    function isIssuedForDissolvedSubnet(uint256 tokenId) internal view returns (bool) {
-        uint64 currentRegistrationBlock =
-            ISubnet(SUBNET_PRECOMPILE).getNetworkRegistrationBlock(VaultMath.netuidOf(tokenId));
-        return currentRegistrationBlock == 0 || currentRegistrationBlock != VaultMath.registrationBlockOf(tokenId);
+    /// @dev The counter identifies generations; migrations may rewrite the registration block.
+    function _subnetState(uint256 tokenId) private view returns (bool ownGeneration, bool registered, bool dissolving) {
+        uint16 netuid = VaultMath.netuidOf(tokenId);
+        ISubnet subnet = ISubnet(SUBNET_PRECOMPILE);
+        ownGeneration = subnet.getRegisteredSubnetCounter(netuid) == VaultMath.generationOf(tokenId);
+        registered = subnet.getNetworkRegistrationBlock(netuid) != 0;
+        dissolving = subnet.isSubnetDissolving(netuid);
     }
 
-    /// @dev Subtensor dissolves a subnet asynchronously over many blocks, and alpha balances and
-    ///      TAO refunds are in flux for the whole window.
+    /// @dev Whether the token's generation is gone; reverts while it is still being cleaned up.
+    function isDissolved(uint256 tokenId) internal view returns (bool) {
+        (bool ownGeneration, bool registered, bool dissolving) = _subnetState(tokenId);
+        if (ownGeneration && dissolving) revert SubnetInDissolutionBlackoutPeriod();
+        return !ownGeneration || !registered;
+    }
+
+    /// @dev Alpha balances are in flux from the start of dissolution on.
+    function isDissolvingOrDissolved(uint256 tokenId) internal view returns (bool) {
+        (bool ownGeneration, bool registered, bool dissolving) = _subnetState(tokenId);
+        return dissolving || !ownGeneration || !registered;
+    }
+
     function isDissolving(uint16 netuid) internal view returns (bool) {
         return ISubnet(SUBNET_PRECOMPILE).isSubnetDissolving(netuid);
     }
 
-    /// @dev Every share-priced path is frozen until dissolution completes. The check is per netuid,
-    ///      so an already-dissolved position is also frozen while a newer subnet on the same netuid
-    ///      dissolves.
     function requireNotDissolving(uint16 netuid) internal view {
         if (isDissolving(netuid)) revert SubnetInDissolutionBlackoutPeriod();
     }
 
-    /// @dev The part of a clone's `balance` a synchronization may fold into the claim index right
-    ///      now, given the liability already `reserved` against it. Zero while the subnet is
-    ///      dissolving or dissolved: from then on new clone balance is the dissolution refund,
-    ///      which the dissolved unwrap path distributes pro rata instead.
+    /// @dev A transfer the chain will refuse burns every unit of gas forwarded to it; refuse it here.
+    function requireTransfersEnabled(uint16 netuid) internal view {
+        (,,,,,,,,, bool transfersEnabled,,) = ISubnet(SUBNET_PRECOMPILE).getSubnetCapacityConfig(netuid);
+        if (!transfersEnabled) revert AlphaTransfersDisabled(netuid);
+    }
+
+    /// @dev TAO arriving during/after dissolution backs redemptions, not the claim index.
     function indexableTao(uint256 tokenId, uint256 balance, uint256 reserved) internal view returns (uint256) {
         uint256 newTao = VaultMath.unreservedTao(balance, reserved);
         if (newTao == 0) return 0;
-        if (isDissolving(VaultMath.netuidOf(tokenId))) return 0;
-        if (isIssuedForDissolvedSubnet(tokenId)) return 0;
+        if (isDissolvingOrDissolved(tokenId)) return 0;
         return newTao;
     }
 
-    // -------------------- Backing record ----------------------------------------
-
-    /// @dev One record per validator the position is spread across. `logical` and `active` differ
-    ///      only while a hotkey swap has moved the stake and the attesters have not caught up.
+    /// @dev `logical` is the attested name; `active` is the recorded stake location, possibly a successor.
+    ///      During recovery, only the parking slot carries the pooled tracked obligation.
     struct Slot {
         bytes32 logical;
         bytes32 active;
         uint256 tracked;
-        uint64 shortSince;
     }
 
-    /// @dev One reading of a record against the chain. A struct because the coverage build
-    ///      compiles at minimum optimization, where returning the parts separately runs the stack
-    ///      out.
-    /// @param keys     The key each slot resolves to.
-    /// @param balances What sits under each of them.
-    /// @param short    Which slots cannot account for themselves.
-    /// @param total    What the reading located in all.
     struct Backing {
         bytes32[] keys;
         uint256[] balances;
@@ -107,13 +125,20 @@ library VaultReads {
         uint256 total;
     }
 
-    /// @dev Expectations are compared with this much give, never for equality. An accepted ceiling
-    ///      on accounting dust the vault will not chase.
+    function logicalsOf(Slot[] memory slots) internal pure returns (bytes32[] memory logicals) {
+        logicals = new bytes32[](slots.length);
+        for (uint256 i; i < slots.length;) {
+            logicals[i] = slots[i].logical;
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Accepted accounting dust; smaller discrepancies do not start recovery.
     uint256 internal constant TRACKED_SLACK_RAO = 1e3;
 
-    /// @dev Reads the record against the chain, writing nothing and resolving at most one hotkey
-    ///      swap per slot. The vault's rails and the lens's quotes share it, so they cannot
-    ///      disagree about what the position holds.
+    /// @dev Resolves at most one successor hop from each recorded active key, without writing it back.
     function resolveBacking(Slot[] memory slots, bytes32 coldkey, uint16 netuid)
         internal
         view
@@ -128,7 +153,7 @@ library VaultReads {
             uint256 balance = IStaking(STAKING_PRECOMPILE).getStake(backing.keys[i], coldkey, netuid);
             if (!coversTracked(balance, tracked)) {
                 (bool followed, bytes32 successor, uint256 successorBalance) =
-                    _followSwap(backing.keys, i, balance, tracked, coldkey, netuid);
+                    _followSwap(backing.keys, i, tracked, coldkey, netuid);
                 if (followed) {
                     backing.keys[i] = successor;
                     balance = successorBalance;
@@ -144,21 +169,13 @@ library VaultReads {
         }
     }
 
-    /// @dev The one shortfall that resolves itself: a validator hotkey swap, accepted only when the
-    ///      successor explains the whole slot. A residual left behind is refused because a slot
-    ///      spread across two keys is more than the record can carry, and a successor another slot
-    ///      answers for is refused because one balance may never back two expectations. Exactly one
-    ///      edge is read, and no price: judging a past event by today's valuation gets it wrong in
-    ///      both directions.
-    function _followSwap(
-        bytes32[] memory keys,
-        uint256 index,
-        uint256 balance,
-        uint256 tracked,
-        bytes32 coldkey,
-        uint16 netuid
-    ) private view returns (bool, bytes32, uint256) {
-        if (balance != 0) return (false, bytes32(0), 0);
+    /// @dev Follow only a successor covering the whole slot. Ignore old-key residue and reject
+    ///      shared successors so one balance never backs two slots. Use alpha, not today's TAO price.
+    function _followSwap(bytes32[] memory keys, uint256 index, uint256 tracked, bytes32 coldkey, uint16 netuid)
+        private
+        view
+        returns (bool, bytes32, uint256)
+    {
         bytes32 successor = hotkeySuccessor(keys[index], netuid);
         if (successor == bytes32(0)) return (false, bytes32(0), 0);
         if (VaultMath.contains(keys, successor)) return (false, bytes32(0), 0);
@@ -167,7 +184,6 @@ library VaultReads {
         return (true, successor, successorBalance);
     }
 
-    /// @dev The hotkey's one-hop successor, or zero when the chain records none.
     function hotkeySuccessor(bytes32 hotkey, uint16 netuid) internal view returns (bytes32) {
         (bool exists, bytes32 successor) = IStaking(STAKING_PRECOMPILE).getHotkeySuccessor(hotkey, netuid);
         if (!exists || successor == hotkey) return bytes32(0);
@@ -184,7 +200,6 @@ library VaultReads {
         }
     }
 
-    /// @dev First short slot of a reading; max when none are.
     function firstShortOf(bool[] memory short) internal pure returns (uint256) {
         for (uint256 i; i < short.length;) {
             if (short[i]) return i;
@@ -192,19 +207,16 @@ library VaultReads {
                 ++i;
             }
         }
-        return type(uint256).max;
+        return NO_SHORT_SLOT;
     }
 
-    /// @dev The one refusal for unaccounted backing, shared so the vault's rails and the lens's
-    ///      quotes cannot disagree about it.
     function requireIntact(Slot[] memory slots, Backing memory backing, uint16 netuid) internal pure {
         uint256 shortIndex = firstShortOf(backing.short);
-        if (shortIndex != type(uint256).max) {
+        if (shortIndex != NO_SHORT_SLOT) {
             revert BackingShortfall(netuid, slots[shortIndex].active, slots[shortIndex].tracked);
         }
     }
 
-    /// @dev Whether `stake` accounts for a slot owed `tracked`.
     function coversTracked(uint256 stake, uint256 tracked) internal pure returns (bool) {
         return stake + TRACKED_SLACK_RAO >= tracked;
     }

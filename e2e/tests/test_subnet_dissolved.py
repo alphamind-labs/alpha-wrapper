@@ -25,7 +25,7 @@ from alpha_e2e.substrate import h160_to_ss58, h160_to_substrate_b32
 
 
 @pytest.mark.scenario
-def test_subnet_dissolved(env):
+def test_dissolution_refunds_holders_and_mailboxes_without_affecting_other_subnets(env):
     # --- Phase 6: two users wrap positions on the soon-dissolved subnet ---------
     dissolved_netuid = env.netuids[0]
     dissolved_token_id = env.token_ids[0]
@@ -136,7 +136,8 @@ def test_subnet_dissolved(env):
     # --- Phase 11: both users recover their pro-rata slice as native TAO ----------
     clone_tao_before = chain.cast_balance_wei(dissolved_clone)
     total_shares = first_user_shares + second_user_shares
-    expected_first_user_tao = clone_tao_before * first_user_shares // total_shares
+    # Native TAO moves in whole RAO, so the vault floors each slice to that quantum.
+    expected_first_user_tao = clone_tao_before * first_user_shares // total_shares // checks.RAO_WEI * checks.RAO_WEI
 
     _, previewed_tao = env.preview_unwrap(dissolved_token_id, first_user_shares)
     assert previewed_tao == expected_first_user_tao, (
@@ -149,40 +150,44 @@ def test_subnet_dissolved(env):
     )
 
     first_user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    first_receipt = env.vault_send(
         2_000_000, "user1 dissolved unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        dissolved_token_id, first_user_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        dissolved_token_id, first_user_shares, env.wrapper_substrate_coldkey, 0,
     )
     assert env.vault_shares(dissolved_token_id) == 0, (
         "user1 shares not burned after the dissolved unwrap"
     )
-    first_user_gain = checks.assert_positive_gain(
-        first_user_tao_before, env.user_tao_wei(),
-        "user1 gained no TAO from the dissolved unwrap",
+    first_user_gain = checks.reconstructed_payout(
+        first_user_tao_before, env.user_tao_wei(), first_receipt, "user1 dissolved payout",
     )
+    assert first_user_gain == expected_first_user_tao, "user1 received the wrong refund share"
 
+    expected_second_user_tao = chain.cast_balance_wei(dissolved_clone) // checks.RAO_WEI * checks.RAO_WEI
     second_user_tao_before = chain.cast_balance_wei(second_user_address)
-    env.vault_send(
+    second_receipt = env.vault_send(
         2_000_000, "user2 dissolved unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        dissolved_token_id, second_user_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        dissolved_token_id, second_user_shares, env.wrapper_substrate_coldkey, 0,
         private_key=second_user_private_key,
     )
     assert env.vault_shares(dissolved_token_id, second_user_address) == 0, (
         "user2 shares not burned after the dissolved unwrap"
     )
-    second_user_gain = checks.assert_positive_gain(
-        second_user_tao_before, chain.cast_balance_wei(second_user_address),
-        "user2 gained no TAO from the dissolved unwrap",
+    second_user_gain = checks.reconstructed_payout(
+        second_user_tao_before, chain.cast_balance_wei(second_user_address), second_receipt,
+        "user2 dissolved payout",
     )
+    assert second_user_gain == expected_second_user_tao, "the last holder did not receive the remaining refund"
 
-    assert chain.cast_balance_wei(dissolved_clone) == 0, (
-        "clone not fully drained after both users unwrapped"
+    clone_tail = chain.cast_balance_wei(dissolved_clone)
+    assert clone_tail < 2 * checks.RAO_WEI, (
+        f"clone kept {clone_tail} wei after both users unwrapped; "
+        "each exit may leave at most a sub-RAO tail"
     )
     print(f"  Pro-rata recovery: user1 +{first_user_gain} wei "
           f"(preview {expected_first_user_tao}), user2 +{second_user_gain} wei; "
-          "clone drained to 0")
+          f"clone tail {clone_tail} wei")
 
     volume_block_end = chain.cast_block_number()
     checks.assert_csv(
@@ -210,44 +215,37 @@ def test_subnet_dissolved(env):
     print("  get_volumes reports dissolved TAO separately from live alpha volume")
 
     # --- Phase 12: recover the never-wrapped mailbox as native TAO -----------------
-    assert chain.cast_code(parked_mailbox) == "0x", (
-        "mailbox clone was materialized before reclaim - lazy-deploy path not exercised"
-    )
     parked_mailbox_tao_before = chain.cast_balance_wei(parked_mailbox)
     user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    mailbox_receipt = env.vault_send(
         2_000_000, "reclaimTaoFromMailbox failed",
         "reclaimTaoFromMailbox(uint256)", parked_netuid,
     )
 
-    assert chain.cast_code(parked_mailbox) != "0x", (
-        "reclaimTaoFromMailbox did not deploy the mailbox clone"
-    )
     assert chain.cast_balance_wei(parked_mailbox) == 0, (
         "mailbox not fully drained after reclaimTaoFromMailbox"
     )
-    gained = checks.assert_positive_gain(
-        user_tao_before, env.user_tao_wei(),
-        "user gained no TAO from reclaimTaoFromMailbox",
+    gained = checks.reconstructed_payout(
+        user_tao_before, env.user_tao_wei(), mailbox_receipt, "mailbox refund",
     )
+    assert gained == parked_mailbox_tao_before, "mailbox reclaim paid less than the drained balance"
     print(f"  Never-wrapped mailbox recovered ({parked_mailbox_tao_before} wei): "
-          f"clone deployed on demand, user net +{gained} wei, mailbox drained to 0")
+          f"user net +{gained} wei, mailbox drained to 0")
 
     # --- Phase 13: the untouched subnet still exits normally -----------------------
     surviving_alpha, _ = env.preview_unwrap(surviving_token_id, surviving_shares)
-    surviving_quote = env.alpha_to_tao_quote(surviving_netuid, surviving_alpha)
 
     user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    receipt = env.vault_send(
         2_500_000, "unwrapForTao on the surviving subnet failed",
         "unwrapForTao(uint256,uint256,uint256)", surviving_token_id, surviving_shares, 0,
     )
     assert env.vault_shares(surviving_token_id) == 0, (
         "shares still outstanding after unwrapForTao on the live subnet"
     )
-    gained = checks.assert_tao_gain_near_quote(
-        user_tao_before, env.user_tao_wei(), surviving_quote,
+    sold_alpha = checks.assert_payout_near_quote(
+        user_tao_before, env.user_tao_wei(), receipt, surviving_netuid, surviving_alpha,
         "surviving-subnet unwrapForTao payout off the alpha->TAO quote",
     )
-    print(f"  Surviving subnet paid {gained} wei (matches quote {surviving_quote} RAO); "
+    print(f"  Surviving subnet sold {sold_alpha} alpha RAO at the chain's quote; "
           f"dissolution was scoped to netuid {dissolved_netuid}")

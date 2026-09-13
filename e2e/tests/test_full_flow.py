@@ -6,7 +6,7 @@ exits, emission accrual, and a validator rotation -- and cross-checks the
 emitted events against the observability scripts in scripts/:
 
   Phase 6   transfer alpha to the deposit mailboxes (split across 3 validators)
-  Phase 7   wrap every deposit (one wrap per validator)
+  Phase 7   wrap every deposit (one wrap per validator), bounded by the lens quote
   Phase 8   verify shares / totalStake / sharePrice on every vault
   Phase 9   unwrap all shares and verify the alpha comes back in full
   Phase 10  observability scripts asserted row-by-row over the deposit window
@@ -30,9 +30,15 @@ from alpha_e2e.substrate import h160_to_ss58, h160_to_substrate_b32
 # Phase 9's single full unwrap can leave a few RAO of per-slot rounding behind.
 FULL_UNWRAP_TOLERANCE_RAO = 10
 
+# What a caller gives up against the lens quote when bounding a wrap. The flush hop
+# shaves chain-side dust off the deposit, so the mint lands just under the quote.
+WRAP_SLIPPAGE_TOLERANCE_PCT = 1
+
 
 @pytest.mark.scenario
-def test_full_flow(env):
+def test_deposits_and_both_exits_survive_emissions_and_validator_rotation(env):
+    deposit_hotkey_count = 1 if env.uses_basic_registry else config.VALIDATORS_PER_SUBNET
+    validator_count = str(deposit_hotkey_count)
     # --- Phase 6: transfer alpha to the deposit mailboxes (3 validators each) ---
     for subnet_index, netuid in enumerate(env.netuids):
         mailbox = env.mailbox_address(netuid)
@@ -40,7 +46,7 @@ def test_full_flow(env):
         mailbox_ss58 = h160_to_ss58(mailbox)
         print(f"  netuid {netuid} mailbox: {mailbox} ({mailbox_ss58})")
 
-        for validator_index in range(config.VALIDATORS_PER_SUBNET):
+        for validator_index in range(deposit_hotkey_count):
             flat_index = subnet_index * config.VALIDATORS_PER_SUBNET + validator_index
             hotkey_pubkey = env.hotkey_pubkeys[flat_index]
 
@@ -54,11 +60,31 @@ def test_full_flow(env):
             )
 
     # --- Phase 7: process deposits (one wrap per validator) --------------------
+    # The first deposit doubles as the mint slippage-guard leg: quote it on the lens,
+    # show a bound above the quote is refused, then wrap under a caller's tolerance.
+    guard_asserted = False
     for subnet_index, netuid in enumerate(env.netuids):
-        for hotkey_pubkey in env.subnet_hotkey_pubkeys(subnet_index):
+        mailbox_coldkey = h160_to_substrate_b32(env.mailbox_address(netuid))
+        for hotkey_pubkey in env.subnet_hotkey_pubkeys(subnet_index)[:deposit_hotkey_count]:
+            min_shares_out = 0
+            if not guard_asserted:
+                deposit_alpha = env.stake(hotkey_pubkey, mailbox_coldkey, netuid)
+                quoted_shares = env.preview_wrap(env.token_ids[subnet_index], deposit_alpha)
+                assert quoted_shares != 0, (
+                    f"previewWrap quoted 0 shares for {deposit_alpha} RAO on netuid {netuid}"
+                )
+                env.assert_vault_reverts_with(
+                    "SlippageExceeded(uint256)", 1_000_000,
+                    "Mint guard: wrap above the previewWrap quote did NOT revert as SlippageExceeded",
+                    "wrap(uint256,bytes32,uint256)", netuid, hotkey_pubkey, quoted_shares * 2,
+                )
+                min_shares_out = quoted_shares * (100 - WRAP_SLIPPAGE_TOLERANCE_PCT) // 100
+                guard_asserted = True
+                print(f"  netuid {netuid}: previewWrap quoted {quoted_shares} shares; "
+                      f"wrapping with minSharesOut={min_shares_out}")
             env.vault_send(
                 1_000_000, f"wrap for netuid {netuid}, hotkey {hotkey_pubkey[:18]}... failed",
-                "wrap(uint256,bytes32)", netuid, hotkey_pubkey,
+                "wrap(uint256,bytes32,uint256)", netuid, hotkey_pubkey, min_shares_out,
             )
 
     # --- Phase 8: verify deposits ----------------------------------------------
@@ -87,8 +113,8 @@ def test_full_flow(env):
 
         env.vault_send(
             2_000_000, f"unwrap for netuid {netuid} failed",
-            "unwrap(uint256,uint256,bytes32)",
-            token_id, shares, env.wrapper_substrate_coldkey,
+            "unwrap(uint256,uint256,bytes32,uint256)",
+            token_id, shares, env.wrapper_substrate_coldkey, 1,
         )
         remaining_shares = env.vault_shares(token_id)
         assert remaining_shares == 0, (
@@ -129,7 +155,7 @@ def test_full_flow(env):
             block_start=env.observation_block_start, block_end=block_end,
             address_args=vault_args,
         ),
-        rows=subnet_count * config.VALIDATORS_PER_SUBNET,
+        rows=subnet_count * deposit_hotkey_count,
         column_sets={"token_id": token_id_set},
         column_eq={"user": config.WRAPPER_USER_ADDRESS},
         column_positive=["assets", "shares"],
@@ -164,11 +190,11 @@ def test_full_flow(env):
         run_observability_script(
             "get_validator_updates",
             block_start=env.registry_block_start, block_end=env.registry_block_end,
-            address_args=["--registry-address", env.validator_registry_address],
+            address_args=["--registry-address", env.validator_registry_address, "--registry-type", env.registry_type],
         ),
         rows=subnet_count,
         column_sets={"netuid": {str(netuid) for netuid in env.netuids}},
-        column_eq={"count": "3"},
+        column_eq={"count": validator_count},
         column_positive=["timestamp"],
     )
 
@@ -185,7 +211,7 @@ def test_full_flow(env):
             column_eq={
                 "token_id": str(token_id),
                 "user": "",
-                "deposit_count": "3",
+                "deposit_count": str(deposit_hotkey_count),
                 "alpha_unwrap_count": "1",
                 "tao_unwrap_count": "0",
                 "dissolved_unwrap_count": "0",
@@ -207,7 +233,7 @@ def test_full_flow(env):
             column_eq={
                 "token_id": str(token_id),
                 "user": config.WRAPPER_USER_ADDRESS,
-                "deposit_count": "3",
+                "deposit_count": str(deposit_hotkey_count),
                 "alpha_unwrap_count": "1",
                 "tao_unwrap_count": "0",
                 "dissolved_unwrap_count": "0",
@@ -231,7 +257,7 @@ def test_full_flow(env):
                 "total_supply": "0",
                 "share_price": "",
                 "share_price_error": "NoSharesOutstanding",
-                "validators_count": "3",
+                "validators_count": validator_count,
             },
         )
 
@@ -252,7 +278,7 @@ def test_full_flow(env):
     assert mailbox_alpha_before > 0, "mailbox has zero alpha before reclaim"
 
     user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    reclaim_receipt = env.vault_send(
         1_500_000, "reclaimMailboxAlphaAsTao failed",
         "reclaimMailboxAlphaAsTao(uint256,bytes32,uint256)",
         reclaim_netuid, reclaim_hotkey_pubkey, 0,
@@ -261,10 +287,13 @@ def test_full_flow(env):
     assert mailbox_alpha_after == 0, (
         f"mailbox still holds {mailbox_alpha_after} RAO after reclaim"
     )
-    gained = checks.assert_positive_gain(
-        user_tao_before, env.user_tao_wei(), "user did not gain TAO from reclaim",
+    checks.assert_payout_near_quote(
+        user_tao_before, env.user_tao_wei(), reclaim_receipt, reclaim_netuid, mailbox_alpha_before,
+        "mailbox sale payout", checks.MAILBOX_TAO_RECLAIM,
     )
-    print(f"  User gained {gained} wei from the mailbox reclaim (net of gas)")
+    checks.assert_payout_matches_emitted(
+        user_tao_before, env.user_tao_wei(), reclaim_receipt, "mailbox sale delivery", checks.MAILBOX_TAO_RECLAIM,
+    )
 
     # --- Phase 12: unwrap shares for TAO --------------------------------------------
     tao_exit_netuid = env.netuids[1]
@@ -279,18 +308,21 @@ def test_full_flow(env):
     )
     tao_exit_shares = env.vault_shares(tao_exit_token_id)
     assert tao_exit_shares != 0, f"no shares minted by wrap on netuid {tao_exit_netuid}"
+    tao_exit_alpha = env.vault_total_stake(tao_exit_token_id)
 
     user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    tao_receipt = env.vault_send(
         2_500_000, "unwrapForTao failed",
         "unwrapForTao(uint256,uint256,uint256)", tao_exit_token_id, tao_exit_shares, 0,
     )
     remaining_shares = env.vault_shares(tao_exit_token_id)
     assert remaining_shares == 0, f"shares still {remaining_shares} after unwrapForTao"
-    gained = checks.assert_positive_gain(
-        user_tao_before, env.user_tao_wei(), "user did not gain TAO from unwrapForTao",
+    checks.assert_payout_near_quote(
+        user_tao_before, env.user_tao_wei(), tao_receipt, tao_exit_netuid, tao_exit_alpha, "full TAO exit payout",
     )
-    print(f"  User gained {gained} wei from unwrapForTao (net of gas)")
+    checks.assert_payout_matches_emitted(
+        user_tao_before, env.user_tao_wei(), tao_receipt, "full TAO exit delivery",
+    )
 
     tao_exit_block_end = chain.cast_block_number()
     checks.assert_csv(
@@ -353,8 +385,8 @@ def test_full_flow(env):
     )
     env.vault_send(
         2_000_000, "Phase 13 unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        emission_token_id, emission_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        emission_token_id, emission_shares, env.wrapper_substrate_coldkey, 1,
     )
     delivered_after = env.total_stake_across(
         env.wrapper_substrate_coldkey, emission_netuid, emission_hotkeys,
@@ -373,35 +405,38 @@ def test_full_flow(env):
     # still pay the holder full value.
     rotation_netuid = env.netuids[1]
     rotation_token_id = env.token_ids[1]
-    kept_hotkey_first = env.hotkey_pubkeys[3]
-    kept_hotkey_second = env.hotkey_pubkeys[4]
-    rotated_out_hotkey = env.hotkey_pubkeys[5]
+    deposit_hotkey, new_target, third_hotkey = env.subnet_hotkey_pubkeys(1)
+    if env.uses_basic_registry:
+        rotated_out_hotkey = deposit_hotkey
+        rotation_hotkeys = [deposit_hotkey, new_target]
+    else:
+        rotated_out_hotkey = third_hotkey
+        rotation_hotkeys = [deposit_hotkey, new_target, third_hotkey]
 
     env.deposit_and_wrap(
-        rotation_netuid, kept_hotkey_first, env.hotkey_ss58s[3],
+        rotation_netuid, deposit_hotkey, env.hotkey_ss58s[3],
         60_000_000_000, 1_500_000, "Phase 14 wrap failed",
     )
     rotation_shares = env.vault_shares(rotation_token_id)
     rotation_deposited = env.vault_total_stake(rotation_token_id)
     rotation_clone_coldkey = env.clone_coldkey(rotation_token_id)
     rotated_out_stake = env.stake(rotated_out_hotkey, rotation_clone_coldkey, rotation_netuid)
-    assert rotated_out_stake != 0, "Phase 14: no stake under the 3rd validator to rotate out"
+    assert rotated_out_stake != 0, "Phase 14: no stake under the validator to rotate out"
     print(f"  Deposited 60 alpha -> shares={rotation_shares}; clone holds "
-          f"{rotated_out_stake} RAO under the soon-rotated-out 3rd validator")
+          f"{rotated_out_stake} RAO under the soon-rotated-out validator")
 
-    # Drop the 3rd validator from the registry via a real EIP-712 attestation; no
-    # vault call runs, so the vault's remembered set still references it and its
-    # stake is left rotated out.
-    env.set_validators(rotation_netuid, [kept_hotkey_first, kept_hotkey_second], [6000, 4000])
+    # Attested drops the third validator; Basic replaces its sole first target
+    # with the second. No vault call runs, so the old stake stays rotated out.
+    env.set_validators(rotation_netuid, [deposit_hotkey, new_target], [6000, 4000],
+                       basic_hotkey=new_target)
 
-    rotation_hotkeys = [kept_hotkey_first, kept_hotkey_second, rotated_out_hotkey]
     delivered_before = env.total_stake_across(
         env.wrapper_substrate_coldkey, rotation_netuid, rotation_hotkeys,
     )
     env.vault_send(
         2_000_000, "Phase 14 unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        rotation_token_id, rotation_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        rotation_token_id, rotation_shares, env.wrapper_substrate_coldkey, 1,
     )
     delivered_after = env.total_stake_across(
         env.wrapper_substrate_coldkey, rotation_netuid, rotation_hotkeys,
@@ -417,7 +452,7 @@ def test_full_flow(env):
         f"<< deposit {rotation_deposited})"
     )
     assert rotated_out_stake_after == 0, (
-        f"Phase 14: rotated-out stake NOT consolidated (3rd validator still holds "
+        f"Phase 14: rotated-out stake NOT consolidated (old validator still holds "
         f"{rotated_out_stake_after} RAO)"
     )
     print(f"  Rotated-out stake consolidated; user received {rotation_received} RAO "

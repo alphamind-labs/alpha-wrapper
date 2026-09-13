@@ -57,7 +57,7 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     partial_burn = env.vault_shares(token_id) * 5 // 6
     env.vault_send(
         2_500_000, "Rotated-out dust: partial unwrap failed",
-        "unwrap(uint256,uint256,bytes32)", token_id, partial_burn, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)", token_id, partial_burn, env.wrapper_substrate_coldkey, 1,
     )
     dust_residue = env.stake(rotated_out_hotkey_pubkey, clone_coldkey, netuid)
     assert env.alpha_value_tao(netuid, dust_residue) < chain_min_stake, (
@@ -65,7 +65,7 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     )
     env.set_validators(
         netuid, [replacement_pubkey, kept_hotkey_b_pubkey, kept_hotkey_c_pubkey],
-        [5000, 3000, 2000],
+        [5000, 3000, 2000], basic_hotkey=kept_hotkey_b_pubkey,
     )
     print(f"  Position is now {dust_residue} alpha RAO of dust under a rotated-out hotkey")
 
@@ -73,8 +73,8 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     refusal_receipt = env.assert_vault_reverts_with(
         "ConsolidationBelowFloor()", 1_500_000,
         "Rotated-out dust: alpha exit did NOT revert as ConsolidationBelowFloor",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, remaining_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, remaining_shares, env.wrapper_substrate_coldkey, 0,
     )
     assert_gas_within(
         refusal_receipt, config.REVERT_GAS_BOUND, "Rotated-out dust: alpha-exit refusal",
@@ -84,8 +84,8 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
 
     # The TAO exit needs no consolidation and full drains are floor-exempt on the
     # chain: it must pay out even from this state.
-    tao_exit_quote = env.alpha_to_tao_quote(netuid, env.vault_total_stake(token_id))
-    min_tao_out = min_tao_out_for(tao_exit_quote)
+    tao_exit_alpha = env.vault_total_stake(token_id)
+    min_tao_out = min_tao_out_for(env.alpha_to_tao_quote(netuid, tao_exit_alpha))
     balance_before = env.user_tao_wei()
     tao_exit_receipt = env.vault_send(
         2_500_000, "Rotated-out dust: TAO exit failed from the dust state",
@@ -93,7 +93,7 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     )
     balance_after = env.user_tao_wei()
     assert_payout_near_quote(
-        balance_before, balance_after, tao_exit_receipt, tao_exit_quote,
+        balance_before, balance_after, tao_exit_receipt, netuid, tao_exit_alpha,
         "Rotated-out dust: TAO exit payout off quote",
     )
     assert_payout_matches_emitted(
@@ -121,8 +121,8 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     )
     env.vault_send(
         2_500_000, "Rotated-out dust: follow-up unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, env.vault_shares(token_id), env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, env.vault_shares(token_id), env.wrapper_substrate_coldkey, 1,
     )
     print("  Round-trip after the dust episode: wrap and unwrap both clean")
 
@@ -161,14 +161,14 @@ def test_price_crash_cannot_lock_exits(env):
     refusal_receipt = env.assert_vault_reverts_with(
         "WithdrawTooSmall()", 1_500_000,
         "Price crash: alpha exit did NOT revert as WithdrawTooSmall",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, crashed_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, crashed_shares, env.wrapper_substrate_coldkey, 0,
     )
     assert_gas_within(refusal_receipt, config.REVERT_GAS_BOUND, "Price crash: alpha-exit refusal")
     print("  Alpha exit refused up front as WithdrawTooSmall, without burning the gas budget")
 
-    tao_exit_quote = env.alpha_to_tao_quote(netuid, env.vault_total_stake(token_id))
-    min_tao_out = min_tao_out_for(tao_exit_quote)
+    tao_exit_alpha = env.vault_total_stake(token_id)
+    min_tao_out = min_tao_out_for(env.alpha_to_tao_quote(netuid, tao_exit_alpha))
     balance_before = env.user_tao_wei()
     tao_exit_receipt = env.vault_send(
         2_500_000, "Price crash: TAO exit failed at the crashed price",
@@ -176,7 +176,7 @@ def test_price_crash_cannot_lock_exits(env):
     )
     balance_after = env.user_tao_wei()
     assert_payout_near_quote(
-        balance_before, balance_after, tao_exit_receipt, tao_exit_quote,
+        balance_before, balance_after, tao_exit_receipt, netuid, tao_exit_alpha,
         "Price crash: TAO exit payout off quote",
     )
     assert_payout_matches_emitted(
@@ -201,8 +201,8 @@ def test_price_crash_cannot_lock_exits(env):
     quoted_alpha, _ = env.preview_unwrap(token_id, post_crash_shares)
     env.vault_send(
         2_500_000, "Price crash: post-crash unwrap failed",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, post_crash_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, post_crash_shares, env.wrapper_substrate_coldkey, 1,
     )
     delivered = env.total_stake_across(
         env.wrapper_substrate_coldkey, netuid,
@@ -285,7 +285,7 @@ def test_sub_floor_co_holder_cannot_be_locked_in_or_leak_the_other_holder(env):
     alpha_refusal_receipt = env.assert_vault_reverts_with(
         "WithdrawTooSmall()", 1_500_000,
         "Co-holder: sub-floor alpha exit did NOT revert as WithdrawTooSmall",
-        "unwrap(uint256,uint256,bytes32)", token_id, small_holder_shares, second_holder_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)", token_id, small_holder_shares, second_holder_coldkey, 0,
         private_key=config.SECOND_HOLDER_PRIVATE_KEY, sender=config.SECOND_HOLDER_ADDRESS,
     )
     assert_gas_within(
@@ -316,8 +316,8 @@ def test_sub_floor_co_holder_cannot_be_locked_in_or_leak_the_other_holder(env):
     small_holder_quote, _ = env.preview_unwrap(token_id, small_holder_shares)
     env.vault_send(
         2_500_000, "Co-holder: post-top-up exit failed",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, small_holder_shares, second_holder_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, small_holder_shares, second_holder_coldkey, 1,
         private_key=config.SECOND_HOLDER_PRIVATE_KEY,
     )
     assert env.vault_shares(token_id, config.SECOND_HOLDER_ADDRESS) == 0, (
@@ -340,8 +340,7 @@ def test_sub_floor_co_holder_cannot_be_locked_in_or_leak_the_other_holder(env):
         large_holder_assets_before - config.CONSOLIDATION_ROUNDING_TOLERANCE_RAO
     ), "Co-holder: large holder's backing shrank"
 
-    large_exit_quote = env.alpha_to_tao_quote(netuid, large_holder_assets_after)
-    min_tao_out = min_tao_out_for(large_exit_quote)
+    min_tao_out = min_tao_out_for(env.alpha_to_tao_quote(netuid, large_holder_assets_after))
     balance_before = env.user_tao_wei()
     large_exit_receipt = env.vault_send(
         2_500_000, "Co-holder: large holder's exit failed",
@@ -350,7 +349,7 @@ def test_sub_floor_co_holder_cannot_be_locked_in_or_leak_the_other_holder(env):
     )
     balance_after = env.user_tao_wei()
     assert_payout_near_quote(
-        balance_before, balance_after, large_exit_receipt, large_exit_quote,
+        balance_before, balance_after, large_exit_receipt, netuid, large_holder_assets_after,
         "Co-holder: large holder's payout off quote",
     )
     assert_payout_matches_emitted(

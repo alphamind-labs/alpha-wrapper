@@ -1,86 +1,69 @@
-# How the alpha wrapper works
+# How it works
 
-The wrapper turns staked alpha on a Bittensor subnet into ERC-1155 tokens
-on the same chain's EVM. You hand it alpha that is already staked; it keeps
-that alpha staked under its own coldkeys and mints you shares. Shares are
-fungible and transferable, and can normally be redeemed for the staked
-alpha or for its TAO value.
+The wrapper keeps Bittensor alpha staked and issues transferable ERC-1155 shares.
+A live position can normally redeem for staked alpha or sell it for native TAO.
+Recovery, chain minimums and subnet state can temporarily prevent exits.
 
-## The contracts
+For a walkthrough of the implementation, read the
+[source flow guide](source-flow-guide.md), covering the position lifecycle,
+transaction ordering, and the separate alpha and TAO accounting.
 
-`AlphaVault` is the contract users send transactions to. It is an ERC-1155
-with one token id per subnet position and holds all the logic,
-permissionless and final at deployment.
+## Contracts and addresses
 
-`AlphaVaultLens` answers the questions: how much alpha backs a position,
-what a share is worth, what a deposit or an exit would pay, and how much
-TAO you can claim. It is deployed alongside a vault, stores nothing, and
-can only read, so there is nothing to trust it with. It reads the same
-chain state the vault reads, so its answers are the ones the vault acts on.
+- `AlphaVault`: deposits, shares, exits and permissionless maintenance. No vault
+  admin; code, registry address, recovery window and parking hotkey are fixed
+  at deployment. Its receiving-key rules, stake consolidation, payout gathering and
+  weight alignment live in `VaultAllocation`, a library deployed once and linked into
+  the vault's bytecode. The library also handles deposit admission and clone
+  creation. Share accounting and backing gates remain in the vault.
+- `AlphaVaultLens`: read-only backing and payout quotes. Use a trusted build paired
+  with the vault; a quote does not guarantee transaction success.
+- `SubnetClone`: one vault-controlled coldkey per subnet registration, isolating
+  that position's stake and TAO from other positions.
+- `DepositMailbox`: one accepted address per user and netuid. The vault only
+  credits the caller's own mailbox.
+- `CloneFactory`: a vault-owned deployer that checks each candidate account
+  before deployment.
+- `ValidatorRegistry`: 1–64 target hotkeys and basis-point weights per subnet,
+  chosen by a quorum of off-chain signers. Its admin manages signer membership.
 
-Each subnet position gets its own `SubnetClone`, a minimal proxy whose EVM
-address maps to a substrate coldkey. All alpha backing a token id is staked
-under that one coldkey, so each position's backing stays isolated. Only
-the vault can drive a clone.
+A token id is `(registrations << 16) | netuid`, where `registrations` is the
+number of times the chain has registered that netuid. Reusing a dissolved netuid
+steps it and creates a different token; old shares retain their old clone and
+refund. A chain migration that rewrites a subnet's registration block leaves its
+token unchanged.
+`currentTokenId(netuid)` identifies the live generation. Users first call
+`createMailbox(netuid, uid)` with a random 32-byte UID; the first call on a
+generation also creates its subnet clone, which later users share. A poisoned
+candidate is rejected and retried with another UID. Only the address the vault
+publishes receives deposits.
 
-Each (user, subnet) pair gets a `DepositMailbox` at a deterministic
-address. You deposit by transferring staked alpha to the mailbox's coldkey
-and then telling the vault to collect it. The mailbox is what makes a
-deposit attributable: the vault only ever credits you for stake sitting in
-your own mailbox.
+## Share value and allocation
 
-`ValidatorRegistry` says which validators the vault should stake under,
-per subnet, and in what proportions. Its entries are set by a threshold of
-off-chain signers (see [attester-guide.md](attester-guide.md)), and the
-vault takes its validator sets from the registry alone.
+Alpha backing divided by supply determines share value, with virtual offsets to
+limit first-depositor inflation. Emissions increase backing without minting shares.
+The lens's `sharePrice` is alpha per share scaled by 1e18; `previewUnwrap` prices a
+specific burn. Native TAO on the clone is accounted separately, not included in
+the live alpha share price.
 
-## Token ids
+Wraps, alpha exits and `rebalance(netuid)` first consolidate dropped validators
+and align stake toward current weights. An alpha exit pays before aligning the
+remainder. Small alignment moves are skipped; current share value depends on total
+backing, while allocation affects future emissions. TAO exits sell where stake
+sits and do not rebalance.
 
-A token id encodes the subnet and its registration block: the low 16 bits
-are the netuid, the bits above are the block the subnet was registered at.
-`currentTokenId(netuid)` computes the id for the currently live subnet.
+## Swaps and recovery
 
-If a subnet is dissolved and its netuid later reused, the new subnet gets
-a new token id. Old shares keep pointing at the old position and its TAO
-refund.
+The vault records where stake actually sits, separately from registry names.
+It follows one successor hop from that recorded location and keeps allocation
+under the coldkey that owned each attested name.
 
-The first `wrap` on a subnet deploys the clone and opens the position;
-`createSubnetProxy(netuid)` deploys it ahead of time.
+Unresolved swaps need a watcher. Missing backing is parked on a hotkey the
+vault's own coldkey controls, by recovery or by a delayed write-off, and stays
+parked until the attesters publish a new set. A name claimed by a stranger is
+retired by attestation. The example, watcher steps and exit restrictions are in
+[Hotkey swaps and recovery](hotkey-swaps.md).
 
-## Share price
-
-Shares are priced by the ratio of staked alpha to share supply. The lens
-call `sharePrice(tokenId)` returns alpha per share, scaled by 1e18. Staking
-emissions accrue to the clone's stake, so the price rises over time and
-later depositors mint fewer shares per alpha. The price counts staked
-alpha only; native TAO sitting on the clone is owed to specific holders
-and tracked separately (see [edge-cases.md](edge-cases.md)).
-
-## Where the stake sits
-
-The registry lists between one and 64 validator hotkeys per subnet, with weights
-in basis points. Deposits and alpha exits rebalance the clone's stake
-toward those weights as a side effect, and anyone may call
-`rebalance(netuid)` to realign immediately, for example right after the
-registry changes; the TAO exit sells from wherever the stake sits.
-Moves the chain would reject as too small are skipped; a
-drifted split is harmless because share value depends on the total stake
-alone.
-
-When the registry drops a validator, the next deposit, alpha exit or
-`rebalance` first rolls the stake off it onto the current set. The vault
-remembers where it put every validator's alpha, so the roll finds stake on
-validators the registry has since dropped.
-
-## Backing the vault cannot find
-
-That record is also how the vault notices backing going missing. A
-validator swapping its hotkey carries the vault's alpha to a new key, and
-the chain sweeps small stake entries without recording why - neither
-involves a vault call. The vault follows the chain's own successor edge one
-hop, which resolves the ordinary swap unaided; anything deeper shuts the
-token for a recovery window fixed at deployment, in which anyone may point
-the vault back at the alpha. Whatever is still missing at the deadline is written off
-across the holders of the moment. The details are in
-[design/backing-resolution.md](design/backing-resolution.md), and what it
-means for a holder is in [edge-cases.md](edge-cases.md).
+Start with the [user guide](user-guide.md) for transactions,
+[attester guide](attester-guide.md) for registry updates, and
+[security model](security-model.md) for trust and loss assumptions.

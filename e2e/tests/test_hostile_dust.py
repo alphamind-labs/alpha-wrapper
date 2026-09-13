@@ -20,7 +20,7 @@ from alpha_e2e.substrate import h160_to_ss58, h160_to_substrate_b32
 
 
 @pytest.mark.scenario
-def test_hostile_dust(env):
+def test_foreign_dust_is_absorbed_without_blocking_holder_flows(env):
     chain_min_stake = env.chain_min_stake_tao()
     print(f"  chain minimum stake = {chain_min_stake} RAO")
 
@@ -99,7 +99,7 @@ def test_hostile_dust(env):
     quoted_first, _ = env.preview_unwrap(token_id, unwrap_burn)
     withdrawal_receipt = env.vault_send(
         2_500_000, "Hostile dust: withdrawal over the hostile plant failed",
-        "unwrap(uint256,uint256,bytes32)", token_id, unwrap_burn, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)", token_id, unwrap_burn, env.wrapper_substrate_coldkey, 1,
     )
     assert_gas_within(
         withdrawal_receipt, config.UNWRAP_GAS_BOUND,
@@ -128,8 +128,8 @@ def test_hostile_dust(env):
     refusal_receipt = env.assert_vault_reverts_with(
         "WithdrawTooSmall()", 1_500_000,
         "Hostile dust: sub-floor remainder did NOT revert as WithdrawTooSmall",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, env.vault_shares(token_id), env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, env.vault_shares(token_id), env.wrapper_substrate_coldkey, 0,
     )
     assert_gas_within(
         refusal_receipt, config.REVERT_GAS_BOUND, "Hostile dust: sub-floor remainder refusal",
@@ -160,7 +160,7 @@ def test_hostile_dust(env):
     plant_refusal_receipt = env.assert_vault_reverts_with(
         "DepositTooSmall()", 1_500_000,
         "Hostile dust: sub-floor mailbox plant did NOT revert as DepositTooSmall",
-        "wrap(uint256,bytes32)", netuid, hotkey_b_pubkey,
+        "wrap(uint256,bytes32,uint256)", netuid, hotkey_b_pubkey, 0,
     )
     assert_gas_within(
         plant_refusal_receipt, config.REVERT_GAS_BOUND,
@@ -190,8 +190,8 @@ def test_hostile_dust(env):
     quoted_final, _ = env.preview_unwrap(token_id, final_shares)
     final_exit_receipt = env.vault_send(
         2_500_000, "Hostile dust: final exit failed",
-        "unwrap(uint256,uint256,bytes32)",
-        token_id, final_shares, env.wrapper_substrate_coldkey,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        token_id, final_shares, env.wrapper_substrate_coldkey, 1,
     )
     assert_gas_within(final_exit_receipt, config.UNWRAP_GAS_BOUND, "Hostile dust: final exit")
     delivered_total = env.total_stake_across(env.wrapper_substrate_coldkey, netuid, all_hotkeys)

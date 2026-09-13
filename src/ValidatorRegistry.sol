@@ -1,28 +1,24 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
+import { VaultMath } from "./libraries/VaultMath.sol";
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { IValidatorRegistry } from "./interfaces/IValidatorRegistry.sol";
+import { IStaking, STAKING_PRECOMPILE } from "./interfaces/IStaking.sol";
 
-/// @dev The vault reads one stake balance per validator on every state-mutating call, and a
-///      rotation settles every slot, so per-call work scales with this cap. 64 keeps the widest
-///      measured path under a tenth of the block gas limit, so a position stays exitable at any
-///      width the registry can commit.
+/// @dev Bounds per-validator reads and storage writes on vault operations.
 uint256 constant MAX_VALIDATORS = 64;
+/// @dev Bounds signer-rotation work even if the admin is compromised.
+uint8 constant MAX_SIGNERS = 16;
 
-/// @title ValidatorRegistry
-/// @notice Per-subnet validator hotkeys + BPS weights, updated by threshold-of-N
-///         off-chain attesters via EIP-712 signed payloads.
+/// @notice Quorum-signed EIP-712 validator weights; hotkey ownership is checked at submission only.
 contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
     bytes32 public constant ATTESTATION_TYPEHASH =
         keccak256("WeightAttestation(uint256 netuid,bytes32[] hotkeys,uint256[] weights,uint256 nonce)");
 
-    uint16 private constant BPS_BASE = 10_000;
-    /// @dev Bounds `_setSigners` churn so a careless or compromised admin can't install a set
-    ///      so large that subsequent rotation exceeds the block gas limit.
-    uint8 private constant MAX_SIGNERS = 16;
+    uint256 private constant MIN_QUORUM = 2;
 
     struct WeightAttestation {
         uint256 netuid;
@@ -34,6 +30,7 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
     struct ValidatorSet {
         bytes32[] hotkeys;
         uint16[] weights;
+        bytes32[] owners;
     }
 
     mapping(address => bool) public isSigner;
@@ -41,7 +38,7 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
     uint8 public threshold;
 
     mapping(uint256 => ValidatorSet) private _validators;
-    mapping(uint256 => uint256) public nonces;
+    mapping(uint256 => uint256) public override nonces;
 
     event SignersUpdated(address[] newSigners, uint8 newThreshold);
     event ValidatorsUpdated(uint256 indexed netuid, uint256 nonce, bytes32[] hotkeys, uint256[] weights);
@@ -57,6 +54,7 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
     error StaleNonce();
     error NotEnoughSignatures();
     error UnknownSigner(address signer);
+    error OwnerlessHotkey(bytes32 hotkey);
     error SignersNotSorted();
     error InsufficientSigners();
     error TooManySigners();
@@ -71,25 +69,17 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
         _setSigners(initialSigners, initialThreshold);
     }
 
-    /// @param signatures Must be sorted by recovered signer address, ascending.
+    /// @param signatures Sorted by recovered signer address, ascending.
     function updateValidators(WeightAttestation calldata attestation, bytes[] calldata signatures) external {
-        uint256 validatorCount = attestation.hotkeys.length;
-        _validatePayload(attestation, validatorCount);
-        _validateNonce(attestation);
-        _verifySignatures(attestation, signatures);
-        _commit(attestation, validatorCount);
+        _update(attestation, signatures);
     }
 
-    /// @param signatures Per-attestation signatures; each entry must be sorted ascending by recovered address.
+    /// @param signatures Each attestation's signatures sorted by recovered signer address, ascending.
     function updateValidatorsBatch(WeightAttestation[] calldata attestations, bytes[][] calldata signatures) external {
         uint256 attestationCount = attestations.length;
         if (attestationCount != signatures.length) revert LengthMismatch();
         for (uint256 i; i < attestationCount;) {
-            uint256 validatorCount = attestations[i].hotkeys.length;
-            _validatePayload(attestations[i], validatorCount);
-            _validateNonce(attestations[i]);
-            _verifySignatures(attestations[i], signatures[i]);
-            _commit(attestations[i], validatorCount);
+            _update(attestations[i], signatures[i]);
             unchecked {
                 ++i;
             }
@@ -101,10 +91,10 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
         external
         view
         override
-        returns (bytes32[] memory hotkeys, uint16[] memory weights)
+        returns (bytes32[] memory hotkeys, uint16[] memory weights, bytes32[] memory owners)
     {
         ValidatorSet storage validatorSet = _validators[netuid];
-        return (validatorSet.hotkeys, validatorSet.weights);
+        return (validatorSet.hotkeys, validatorSet.weights, validatorSet.owners);
     }
 
     function setSigners(address[] calldata newSigners, uint8 newThreshold) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -113,9 +103,9 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
 
     function _setSigners(address[] memory newSigners, uint8 newThreshold) private {
         uint256 newSignerCount = newSigners.length;
-        if (newSignerCount < 2) revert InsufficientSigners();
+        if (newSignerCount < MIN_QUORUM) revert InsufficientSigners();
         if (newSignerCount > MAX_SIGNERS) revert TooManySigners();
-        if (newThreshold < 2) revert ThresholdTooLow();
+        if (newThreshold < MIN_QUORUM) revert ThresholdTooLow();
         if (newThreshold > newSignerCount) revert ThresholdExceedsSigners();
 
         address[] memory oldSigners = signers;
@@ -144,17 +134,28 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
         emit SignersUpdated(newSigners, newThreshold);
     }
 
-    function _validatePayload(WeightAttestation calldata attestation, uint256 validatorCount) private pure {
+    /// @dev Cheapest first: an attestation that never lands pays for no chain read. Ownership is the
+    ///      only lookup, and it runs once the payload is well formed and carries a signer quorum.
+    function _update(WeightAttestation calldata attestation, bytes[] calldata signatures) private {
+        _validateNonce(attestation);
+        _validateShape(attestation);
+        _verifySignatures(attestation, signatures);
+        _commit(attestation, _resolveOwners(attestation.hotkeys));
+    }
+
+    function _validateShape(WeightAttestation calldata attestation) private pure {
+        uint256 validatorCount = attestation.hotkeys.length;
         if (attestation.netuid > type(uint16).max) revert NetuidOutOfRange();
         if (validatorCount == 0 || validatorCount > MAX_VALIDATORS) revert InvalidValidatorCount();
         if (validatorCount != attestation.weights.length) revert LengthMismatch();
 
         uint256 sum;
         for (uint256 i; i < validatorCount;) {
-            if (attestation.hotkeys[i] == bytes32(0)) revert ZeroValue();
+            bytes32 hotkey = attestation.hotkeys[i];
+            if (hotkey == bytes32(0)) revert ZeroValue();
             if (attestation.weights[i] == 0) revert ZeroWeight();
             for (uint256 j = i + 1; j < validatorCount;) {
-                if (attestation.hotkeys[i] == attestation.hotkeys[j]) revert DuplicateValue();
+                if (hotkey == attestation.hotkeys[j]) revert DuplicateValue();
                 unchecked {
                     ++j;
                 }
@@ -164,13 +165,25 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
                 ++i;
             }
         }
-        if (sum != BPS_BASE) revert WeightsMustSum10000();
+        if (sum != VaultMath.BPS_BASE) revert WeightsMustSum10000();
     }
 
-    /// @dev A signed attestation stays valid only until any attestation lands on the same subnet,
-    ///      so the nonce alone bounds its life. It can never rewind the stored set either: while the
-    ///      nonce is unadvanced the stored set is the one that preceded every attestation contending
-    ///      for it, so whichever lands is at least as recent as what it replaces.
+    /// @dev Reject ownerless targets before installing a set; the owners are recorded so the vault can
+    ///      tell the attested validator from whoever claims a vacated name later.
+    function _resolveOwners(bytes32[] calldata hotkeys) private view returns (bytes32[] memory owners) {
+        uint256 validatorCount = hotkeys.length;
+        owners = new bytes32[](validatorCount);
+        for (uint256 i; i < validatorCount;) {
+            (bool exists, bytes32 owner) = IStaking(STAKING_PRECOMPILE).getHotkeyOwner(hotkeys[i]);
+            if (!exists) revert OwnerlessHotkey(hotkeys[i]);
+            owners[i] = owner;
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Signatures have no expiry; landing any update invalidates competing payloads at its nonce.
     function _validateNonce(WeightAttestation calldata attestation) private view {
         if (attestation.nonce != nonces[attestation.netuid] + 1) revert StaleNonce();
     }
@@ -192,15 +205,17 @@ contract ValidatorRegistry is IValidatorRegistry, EIP712, AccessControl {
         }
     }
 
-    function _commit(WeightAttestation calldata attestation, uint256 validatorCount) private {
+    function _commit(WeightAttestation calldata attestation, bytes32[] memory owners) private {
         nonces[attestation.netuid] = attestation.nonce;
         ValidatorSet storage validatorSet = _validators[attestation.netuid];
         delete validatorSet.hotkeys;
         delete validatorSet.weights;
-        for (uint256 i; i < validatorCount;) {
+        delete validatorSet.owners;
+        for (uint256 i; i < owners.length;) {
             validatorSet.hotkeys.push(attestation.hotkeys[i]);
-            // The sum == BPS_BASE check bounds every weight well inside uint16.
+            // The weight sum bounds this cast to 10000.
             validatorSet.weights.push(uint16(attestation.weights[i]));
+            validatorSet.owners.push(owners[i]);
             unchecked {
                 ++i;
             }

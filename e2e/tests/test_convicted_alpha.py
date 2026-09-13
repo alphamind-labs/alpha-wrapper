@@ -1,9 +1,8 @@
 """Scenario: convicted (conviction-locked) alpha.
 
 Conviction locks bind a coldkey's subnet-wide alpha, and contract-controlled
-coldkeys reject locked inflow (the accept-locked flag defaults OFF and no
-precompile can flip it). A deposit dipping into locked mass therefore reverts
-at the depositor's own transferStake, before the vault is involved; the free
+coldkeys reject locked inflow (creation verifies the chain's rejection default).
+A deposit dipping into locked mass therefore reverts at the depositor's own transferStake, before the vault is involved; the free
 portion wraps normally; and vault flows -- rebalance, unwrap (including to a
 coldkey that itself holds a lock), unwrapForTao -- never touch lock state.
 
@@ -113,7 +112,7 @@ def test_convicted_alpha(env):
     shares_before_reverted_wrap = env.vault_shares(test_token_id)
     env.vault_send_expect_revert(
         1_500_000, "wrap with no arrived deposit did NOT revert",
-        "wrap(uint256,bytes32)", test_netuid, test_hotkey_pubkey,
+        "wrap(uint256,bytes32,uint256)", test_netuid, test_hotkey_pubkey, 0,
     )
     shares_after_reverted_wrap = env.vault_shares(test_token_id)
     assert shares_after_reverted_wrap == shares_before_reverted_wrap, (
@@ -153,8 +152,8 @@ def test_convicted_alpha(env):
 
     env.vault_send(
         2_000_000, "unwrap to a lock-holding coldkey failed",
-        "unwrap(uint256,uint256,bytes32)",
-        test_token_id, half_shares, config.ALICE_COLDKEY_PUBKEY,
+        "unwrap(uint256,uint256,bytes32,uint256)",
+        test_token_id, half_shares, config.ALICE_COLDKEY_PUBKEY, 1,
     )
 
     alice_received_alpha = alice_subnet_alpha() - alice_subnet_alpha_before_unwrap
@@ -177,19 +176,17 @@ def test_convicted_alpha(env):
     # --- Phase 10: unwrapForTao works while a large lock exists on the subnet -------
     remaining_shares = env.vault_shares(test_token_id)
     previewed_remaining_alpha, _ = env.preview_unwrap(test_token_id, remaining_shares)
-    remaining_tao_quote = env.alpha_to_tao_quote(test_netuid, previewed_remaining_alpha)
 
     user_tao_before = env.user_tao_wei()
-    env.vault_send(
+    receipt = env.vault_send(
         2_500_000, "unwrapForTao failed on a subnet with active locks",
         "unwrapForTao(uint256,uint256,uint256)", test_token_id, remaining_shares, 0,
     )
     final_shares = env.vault_shares(test_token_id)
     assert final_shares == 0, f"shares still {final_shares} after unwrapForTao"
 
-    tao_gained = checks.assert_tao_gain_near_quote(
-        user_tao_before, env.user_tao_wei(), remaining_tao_quote,
+    sold_alpha = checks.assert_payout_near_quote(
+        user_tao_before, env.user_tao_wei(), receipt, test_netuid, previewed_remaining_alpha,
         "unwrapForTao payout off the alpha->TAO quote",
     )
-    print(f"  Remaining shares exited as TAO: gained {tao_gained} wei "
-          f"(quote {remaining_tao_quote} RAO)")
+    print(f"  Remaining shares exited as TAO: sold {sold_alpha} alpha RAO at the chain's quote")

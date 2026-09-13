@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.36;
 
+import { VaultMath } from "src/libraries/VaultMath.sol";
 import { Test, Vm } from "forge-std/Test.sol";
-import { ValidatorRegistry, MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { ValidatorRegistry, MAX_VALIDATORS, MAX_SIGNERS } from "src/ValidatorRegistry.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 import { AttestationHelper } from "./helpers/AttestationHelper.sol";
+import { MockStaking } from "./mocks/MockStaking.sol";
+import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
 
 contract ValidatorRegistryTest is AttestationHelper {
     event SignersUpdated(address[] newSigners, uint8 newThreshold);
@@ -32,6 +35,12 @@ contract ValidatorRegistryTest is AttestationHelper {
     ValidatorRegistry private registry;
 
     function setUp() public {
+        _etchStakingMock();
+        _recordHotkeyOwner(hk1);
+        _recordHotkeyOwner(hk2);
+        _recordHotkeyOwner(hk3);
+        _recordHotkeyOwners(_hotkeysFrom("validator", MAX_VALIDATORS));
+
         s1 = vm.addr(PK1);
         s2 = vm.addr(PK2);
         s3 = vm.addr(PK3);
@@ -55,7 +64,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         att.weights = new uint256[](len);
         if (len == 1) {
             att.hotkeys[0] = hk1;
-            att.weights[0] = 10_000;
+            att.weights[0] = VaultMath.BPS_BASE;
         } else if (len == 2) {
             att.hotkeys[0] = hk1;
             att.hotkeys[1] = hk2;
@@ -71,8 +80,6 @@ contract ValidatorRegistryTest is AttestationHelper {
         }
     }
 
-    /// @dev Attestation over `count` distinct hotkeys, evenly weighted with the rounding remainder
-    ///      on the last. Use for set sizes the fixed `_att` fixtures above do not cover.
     function _attN(uint256 netuid, uint256 count, uint256 nonce)
         private
         pure
@@ -81,10 +88,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         return _buildAttestation(netuid, _hotkeysFrom("validator", count), _evenWeights(count), nonce);
     }
 
-    /// @dev Sign with each privkey in the order given. Caller is responsible for ordering
-    ///      `pks` so recovered addresses ascend; the contract's `_verifySignatures` enforces
-    ///      that. PK address order is PK2 < PK3 < PK1 < PK_UNKNOWN - the `_pksN` helpers
-    ///      below are written with this in mind.
+    /// @dev Recovered address order: PK2 < PK3 < PK1 < PK_UNKNOWN.
     function _sign(ValidatorRegistry.WeightAttestation memory att, uint256[] memory pks)
         private
         view
@@ -104,6 +108,42 @@ contract ValidatorRegistryTest is AttestationHelper {
         pks[0] = a;
         pks[1] = b;
         pks[2] = c;
+    }
+
+    function test_UpdateValidators_RecordsTheOwnerOfEachAttestedHotkey() public {
+        bytes32[] memory hks = new bytes32[](2);
+        hks[0] = hk1;
+        hks[1] = hk2;
+        uint16[] memory wts = new uint16[](2);
+        wts[0] = 6000;
+        wts[1] = 4000;
+        MockStaking mock = MockStaking(STAKING_PRECOMPILE);
+
+        _submitAttestation(registry, SN1, hks, wts, _pks2(PK2, PK1));
+
+        (,, bytes32[] memory owners) = registry.getValidators(SN1);
+        assertEq(owners.length, 2, "one owner per attested name");
+        assertEq(owners[0], mock.ownerOf(hk1), "the first name is bound to its owner");
+        assertEq(owners[1], mock.ownerOf(hk2), "and so is the second");
+        (,, bytes32[] memory none) = registry.getValidators(SN2);
+        assertEq(none.length, 0, "a subnet never attested has no owners on record");
+    }
+
+    function test_UpdateValidators_RecordsWhoeverHoldsARepublishedName() public {
+        bytes32[] memory hks = new bytes32[](2);
+        hks[0] = hk1;
+        hks[1] = hk2;
+        uint16[] memory wts = new uint16[](2);
+        wts[0] = 6000;
+        wts[1] = 4000;
+        _submitAttestation(registry, SN1, hks, wts, _pks2(PK2, PK1));
+        bytes32 squatter = keccak256("squatter");
+        MockStaking(STAKING_PRECOMPILE).setHotkeyOwner(hk1, squatter);
+
+        _submitAttestation(registry, SN1, hks, wts, _pks2(PK2, PK1));
+
+        (,, bytes32[] memory owners) = registry.getValidators(SN1);
+        assertEq(owners[0], squatter, "the registry binds the name to its current holder");
     }
 
     function test_RevertWhen_AdminIsZeroAddress() public {
@@ -169,8 +209,8 @@ contract ValidatorRegistryTest is AttestationHelper {
     }
 
     function test_RevertWhen_TooManyInitialSigners() public {
-        address[] memory init = new address[](17);
-        for (uint256 i; i < 17; ++i) {
+        address[] memory init = new address[](MAX_SIGNERS + 1);
+        for (uint256 i; i < init.length; ++i) {
             init[i] = vm.addr(uint256(keccak256(abi.encode("init-signer", i))));
         }
         vm.expectRevert(ValidatorRegistry.TooManySigners.selector);
@@ -275,8 +315,8 @@ contract ValidatorRegistryTest is AttestationHelper {
     }
 
     function test_RevertWhen_SetSignersTooMany() public {
-        address[] memory ns = new address[](17);
-        for (uint256 i; i < 17; ++i) {
+        address[] memory ns = new address[](MAX_SIGNERS + 1);
+        for (uint256 i; i < ns.length; ++i) {
             ns[i] = vm.addr(uint256(keccak256(abi.encode("set-signer", i))));
         }
         vm.expectRevert(ValidatorRegistry.TooManySigners.selector);
@@ -284,12 +324,12 @@ contract ValidatorRegistryTest is AttestationHelper {
     }
 
     function test_SetSigners_AcceptsMaxSigners() public {
-        address[] memory ns = new address[](16);
-        for (uint256 i; i < 16; ++i) {
+        address[] memory ns = new address[](MAX_SIGNERS);
+        for (uint256 i; i < ns.length; ++i) {
             ns[i] = vm.addr(uint256(keccak256(abi.encode("max-signer", i))));
         }
         registry.setSigners(ns, 2);
-        assertEq(registry.signers(15), ns[15]);
+        assertEq(registry.signers(MAX_SIGNERS - 1), ns[MAX_SIGNERS - 1]);
     }
 
     function test_SetSigners_RemovedSignersUnmarked() public {
@@ -355,7 +395,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att, sigs);
 
         assertEq(registry.nonces(SN1), 1);
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, 2);
         assertEq(wts.length, 2);
         assertEq(hks[0], hk1);
@@ -372,7 +412,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(narrow, _sign(narrow, _pks2(PK2, PK1)));
 
         assertEq(registry.nonces(SN1), 2);
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, 3);
         assertEq(wts.length, 3);
         for (uint256 i; i < 3; ++i) {
@@ -388,7 +428,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         ValidatorRegistry.WeightAttestation memory wide = _attN(SN1, MAX_VALIDATORS, 2);
         registry.updateValidators(wide, _sign(wide, _pks2(PK2, PK1)));
 
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, MAX_VALIDATORS);
         assertEq(wts.length, MAX_VALIDATORS);
         uint256 sum;
@@ -396,7 +436,7 @@ contract ValidatorRegistryTest is AttestationHelper {
             assertEq(hks[i], wide.hotkeys[i]);
             sum += wts[i];
         }
-        assertEq(sum, 10_000);
+        assertEq(sum, VaultMath.BPS_BASE);
     }
 
     function test_Update_OverwritesPreviousAttestationOnGrow() public {
@@ -407,7 +447,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att2, _sign(att2, _pks2(PK2, PK1)));
 
         assertEq(registry.nonces(SN1), 2);
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks[0], hk1);
         assertEq(hks[1], hk2);
         assertEq(hks[2], hk3);
@@ -429,15 +469,13 @@ contract ValidatorRegistryTest is AttestationHelper {
         assertEq(registry.nonces(SN1), 2);
         assertEq(registry.nonces(SN2), 1);
 
-        // SN1 final state: a3 (len=1, hk1, 10_000)
-        (bytes32[] memory hks1, uint16[] memory wts1) = registry.getValidators(SN1);
+        (bytes32[] memory hks1, uint16[] memory wts1,) = registry.getValidators(SN1);
         assertEq(hks1.length, 1);
         assertEq(wts1.length, 1);
         assertEq(hks1[0], hk1);
-        assertEq(wts1[0], 10_000);
+        assertEq(wts1[0], VaultMath.BPS_BASE);
 
-        // SN2 final state: a2 (len=3, hk1/hk2/hk3, 5000/3000/2000)
-        (bytes32[] memory hks2, uint16[] memory wts2) = registry.getValidators(SN2);
+        (bytes32[] memory hks2, uint16[] memory wts2,) = registry.getValidators(SN2);
         assertEq(hks2.length, 3);
         assertEq(hks2[0], hk1);
         assertEq(hks2[1], hk2);
@@ -453,7 +491,7 @@ contract ValidatorRegistryTest is AttestationHelper {
 
         registry.updateValidators(att, _sign(att, _pks2(PK2, PK1)));
 
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, count);
         assertEq(wts.length, count);
         uint256 sum;
@@ -462,10 +500,9 @@ contract ValidatorRegistryTest is AttestationHelper {
             assertEq(wts[i], att.weights[i]);
             sum += wts[i];
         }
-        assertEq(sum, 10_000);
+        assertEq(sum, VaultMath.BPS_BASE);
     }
 
-    /// @dev A commit replaces the whole set whichever way the size moves.
     function testFuzz_Update_SequentialCommitsReplaceWholeSet(uint256 firstCount, uint256 secondCount) public {
         firstCount = bound(firstCount, 1, MAX_VALIDATORS);
         secondCount = bound(secondCount, 1, MAX_VALIDATORS);
@@ -476,7 +513,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         ValidatorRegistry.WeightAttestation memory second = _attN(SN1, secondCount, 2);
         registry.updateValidators(second, _sign(second, _pks2(PK2, PK1)));
 
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, secondCount, "size follows the latest commit");
         assertEq(wts.length, secondCount);
         for (uint256 i; i < secondCount; ++i) {
@@ -577,10 +614,62 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att, sigs);
     }
 
+    function test_RevertWhen_HotkeyHasNoOwner() public {
+        bytes32 mistyped = keccak256("mistyped-hotkey");
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        att.hotkeys[1] = mistyped;
+        bytes[] memory sigs = _sign(att, _pks2(PK2, PK1));
+
+        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.OwnerlessHotkey.selector, mistyped));
+        registry.updateValidators(att, sigs);
+    }
+
+    function test_RevertWhen_HotkeyLostItsOwnerToASwap() public {
+        MockStaking(STAKING_PRECOMPILE).setHotkeyDeleted(hk2, true);
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory sigs = _sign(att, _pks2(PK2, PK1));
+
+        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.OwnerlessHotkey.selector, hk2));
+        registry.updateValidators(att, sigs);
+    }
+
+    function test_RevertWhen_BatchNamesAnOwnerlessHotkey() public {
+        bytes32 mistyped = keccak256("mistyped-hotkey");
+        ValidatorRegistry.WeightAttestation[] memory atts = new ValidatorRegistry.WeightAttestation[](2);
+        atts[0] = _att(SN1, 2, 1);
+        atts[1] = _att(SN2, 1, 1);
+        atts[1].hotkeys[0] = mistyped;
+
+        bytes[][] memory sigs = new bytes[][](2);
+        sigs[0] = _sign(atts[0], _pks2(PK2, PK1));
+        sigs[1] = _sign(atts[1], _pks2(PK2, PK1));
+
+        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.OwnerlessHotkey.selector, mistyped));
+        registry.updateValidatorsBatch(atts, sigs);
+
+        assertEq(registry.nonces(SN1), 0, "the entry ahead of the bad one committed nothing");
+        assertEq(registry.nonces(SN2), 0);
+    }
+
+    function testFuzz_Update_CommitsAnyOwnedSet(uint256 count, uint256 saltSeed) public {
+        count = bound(count, 1, MAX_VALIDATORS);
+        bytes32[] memory hotkeys = _hotkeysFrom(vm.toString(saltSeed), count);
+        _recordHotkeyOwners(hotkeys);
+
+        ValidatorRegistry.WeightAttestation memory att = _buildAttestation(SN1, hotkeys, _evenWeights(count), 1);
+        registry.updateValidators(att, _sign(att, _pks2(PK2, PK1)));
+
+        (bytes32[] memory hks,,) = registry.getValidators(SN1);
+        assertEq(hks.length, count);
+        for (uint256 i; i < count; ++i) {
+            assertEq(hks[i], hotkeys[i]);
+        }
+    }
+
     function test_RevertWhen_WeightsSumBelowBpsBase() public {
         ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
         att.weights[0] = 6_000;
-        att.weights[1] = 3_999; // sum 9_999
+        att.weights[1] = 3_999;
         bytes[] memory sigs = _sign(att, _pks2(PK2, PK1));
         vm.expectRevert(ValidatorRegistry.WeightsMustSum10000.selector);
         registry.updateValidators(att, sigs);
@@ -589,7 +678,7 @@ contract ValidatorRegistryTest is AttestationHelper {
     function test_RevertWhen_WeightsSumAboveBpsBase() public {
         ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
         att.weights[0] = 6_000;
-        att.weights[1] = 4_001; // sum 10_001
+        att.weights[1] = 4_001;
         bytes[] memory sigs = _sign(att, _pks2(PK2, PK1));
         vm.expectRevert(ValidatorRegistry.WeightsMustSum10000.selector);
         registry.updateValidators(att, sigs);
@@ -619,8 +708,6 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att, sigs);
     }
 
-    /// @dev Signatures carry no expiry, so no amount of elapsed time invalidates one. What ends an
-    ///      attestation's life is a landing on the same subnet, covered by the nonce reverts above.
     function test_Update_AcceptsAfterLongDelay() public {
         ValidatorRegistry.WeightAttestation memory att = _att(SN1, 3, 1);
         bytes[] memory sigs = _sign(att, _pks2(PK2, PK1));
@@ -629,7 +716,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att, sigs);
 
         assertEq(registry.nonces(SN1), 1);
-        (bytes32[] memory hks,) = registry.getValidators(SN1);
+        (bytes32[] memory hks,,) = registry.getValidators(SN1);
         assertEq(hks.length, 3);
     }
 
@@ -658,7 +745,6 @@ contract ValidatorRegistryTest is AttestationHelper {
 
     function test_RevertWhen_SignaturesNotSortedByRecoveredAddress() public {
         ValidatorRegistry.WeightAttestation memory att = _att(SN1, 1, 1);
-        // Intentionally non-ascending: PK1's address > PK2's, so passing (PK1, PK2) breaks order.
         bytes[] memory sigs = _sign(att, _pks2(PK1, PK2));
         vm.expectRevert(ValidatorRegistry.SignersNotSorted.selector);
         registry.updateValidators(att, sigs);
@@ -691,8 +777,6 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidators(att, sigs);
     }
 
-    /// @dev Sign with the current set, rotate to a new set, then submit. The verify-time
-    ///      `isSigner` check kills the stockpiled attestation.
     function test_RevertWhen_AttestationSignedByRotatedOutSigner() public {
         ValidatorRegistry.WeightAttestation memory att = _att(SN1, 1, 1);
         bytes[] memory oldSigs = _sign(att, _pks2(PK2, PK1));
@@ -704,11 +788,10 @@ contract ValidatorRegistryTest is AttestationHelper {
         ns[1] = e;
         registry.setSigners(ns, 2);
 
-        // oldSigs sort ascending to [s2, s1], so the contract recovers s2 first; it is no longer a signer.
+        // s2 is recovered first from the sorted signatures, so it determines the revert argument.
         vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.UnknownSigner.selector, s2));
         registry.updateValidators(att, oldSigs);
 
-        // State is unchanged after the failed submission.
         assertEq(registry.nonces(SN1), 0);
     }
 
@@ -716,7 +799,6 @@ contract ValidatorRegistryTest is AttestationHelper {
         ValidatorRegistry.WeightAttestation memory a1 = _att(SN1, 1, 1);
         bytes[] memory sigs1 = _sign(a1, _pks2(PK2, PK1));
 
-        // Construct an alternative attestation also at nonce 1 with different content
         ValidatorRegistry.WeightAttestation memory a2 = _att(SN1, 2, 1);
         bytes[] memory sigs2 = _sign(a2, _pks2(PK2, PK1));
 
@@ -726,13 +808,77 @@ contract ValidatorRegistryTest is AttestationHelper {
         vm.expectRevert(ValidatorRegistry.StaleNonce.selector);
         registry.updateValidators(a2, sigs2);
 
-        // State of SN1 must still be a1's content (len=1, hk1, 10_000), not partially overwritten by a2.
         assertEq(registry.nonces(SN1), 1);
-        (bytes32[] memory hks, uint16[] memory wts) = registry.getValidators(SN1);
+        (bytes32[] memory hks, uint16[] memory wts,) = registry.getValidators(SN1);
         assertEq(hks.length, 1);
         assertEq(wts.length, 1);
         assertEq(hks[0], hk1);
-        assertEq(wts[0], 10_000);
+        assertEq(wts[0], VaultMath.BPS_BASE);
+    }
+
+    function test_SignatureForAnotherRegistry_RejectsTheValidatorSet() public {
+        address[] memory signers = new address[](2);
+        signers[0] = s1;
+        signers[1] = s2;
+        ValidatorRegistry other = new ValidatorRegistry(admin, signers, 2);
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+
+        vm.expectPartialRevert(ValidatorRegistry.UnknownSigner.selector);
+        other.updateValidators(att, signatures);
+        assertEq(other.nonces(SN1), 0);
+    }
+
+    function test_SignatureFromAnotherChain_RejectsTheValidatorSet() public {
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+        vm.chainId(block.chainid + 1);
+
+        vm.expectPartialRevert(ValidatorRegistry.UnknownSigner.selector);
+        registry.updateValidators(att, signatures);
+        assertEq(registry.nonces(SN1), 0);
+    }
+
+    function test_ChangedSignedNetuid_RejectsTheAttestation() public {
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+        att.netuid = SN2;
+
+        _assertSignatureRejected(att, signatures);
+    }
+
+    function test_ChangedSignedHotkey_RejectsTheAttestation() public {
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+        att.hotkeys[0] = hk3;
+
+        _assertSignatureRejected(att, signatures);
+    }
+
+    function test_ChangedSignedWeights_RejectsTheAttestation() public {
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 1);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+        att.weights[0] = 6001;
+        att.weights[1] = 3999;
+
+        _assertSignatureRejected(att, signatures);
+    }
+
+    function test_ChangedSignedNonce_RejectsTheAttestation() public {
+        ValidatorRegistry.WeightAttestation memory att = _att(SN1, 2, 2);
+        bytes[] memory signatures = _sign(att, _pks2(PK2, PK1));
+        att.nonce = 1;
+
+        _assertSignatureRejected(att, signatures);
+    }
+
+    function _assertSignatureRejected(ValidatorRegistry.WeightAttestation memory att, bytes[] memory signatures)
+        private
+    {
+        // The altered payload passes shape and nonce checks, isolating signature binding.
+        vm.expectPartialRevert(ValidatorRegistry.UnknownSigner.selector);
+        registry.updateValidators(att, signatures);
+        assertEq(registry.nonces(att.netuid), 0);
     }
 
     function test_Batch_CommitsAllEntries() public {
@@ -752,13 +898,13 @@ contract ValidatorRegistryTest is AttestationHelper {
         assertEq(registry.nonces(SN2), 1);
         assertEq(registry.nonces(100), 1);
 
-        (bytes32[] memory hksA,) = registry.getValidators(SN1);
-        (bytes32[] memory hksB,) = registry.getValidators(SN2);
-        (bytes32[] memory hksC, uint16[] memory wtsC) = registry.getValidators(100);
+        (bytes32[] memory hksA,,) = registry.getValidators(SN1);
+        (bytes32[] memory hksB,,) = registry.getValidators(SN2);
+        (bytes32[] memory hksC, uint16[] memory wtsC,) = registry.getValidators(100);
         assertEq(hksA[2], hk3);
         assertEq(hksB[1], hk2);
         assertEq(hksC[0], hk1);
-        assertEq(wtsC[0], 10_000);
+        assertEq(wtsC[0], VaultMath.BPS_BASE);
     }
 
     function test_Batch_EmitsValidatorsUpdatedPerEntry() public {
@@ -852,7 +998,7 @@ contract ValidatorRegistryTest is AttestationHelper {
         registry.updateValidatorsBatch(atts, sigs);
 
         assertEq(registry.nonces(SN1), 2);
-        (bytes32[] memory hks,) = registry.getValidators(SN1);
+        (bytes32[] memory hks,,) = registry.getValidators(SN1);
         assertEq(hks[1], hk2);
     }
 }

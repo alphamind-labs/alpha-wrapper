@@ -1,15 +1,14 @@
 """Scenario: the vault stays live through every dust state.
 
-No sequence of deposits, withdrawals, and validator changes can leave the vault
-stuck behind leftovers too small for the chain to move. Two churn cycles scatter
-every kind of leftover - withdrawal remainders, skipped rebalances, sale
-leftovers, balances on rotated-out validators - and every call along the way
-keeps working at normal gas cost. A closing ledger then checks that everything
-deposited came back out, as delivered alpha or as TAO from sales.
+Two churn cycles exercise withdrawal remainders, skipped rebalances, sale
+leftovers, and balances on rotated-out validators. Each eligible call must
+succeed within its gas budget. The closing ledger provides a lower-bound
+smoke check because previously delivered alpha continues earning emissions;
+the Foundry accounting campaign separately checks exact conservation.
 """
 import pytest
 
-from alpha_e2e import bootstrap, config
+from alpha_e2e import bootstrap, chain, config
 from alpha_e2e.checks import (
     assert_gas_within, assert_payout_matches_emitted, assert_payout_near_quote, min_tao_out_for,
 )
@@ -61,8 +60,8 @@ class ChurnLedger:
         quoted_alpha, _ = self.env.preview_unwrap(self.token_id, burn)
         receipt = self.env.vault_send(
             2_500_000, f"{label}: unwrap failed",
-            "unwrap(uint256,uint256,bytes32)",
-            self.token_id, burn, self.env.wrapper_substrate_coldkey,
+            "unwrap(uint256,uint256,bytes32,uint256)",
+            self.token_id, burn, self.env.wrapper_substrate_coldkey, 1,
         )
         assert_gas_within(receipt, config.UNWRAP_GAS_BOUND, f"{label}: unwrap")
         delivered = self.delivered_alpha_total() - delivered_before
@@ -75,13 +74,13 @@ class ChurnLedger:
         print(f"  {label}: unwrapped {percent}% of shares, delivered {delivered} alpha RAO")
 
     def unwrap_for_tao_step(self, label: str, percent: int) -> None:
-        total_before = self.env.vault_total_stake(self.token_id)
-        burn = self.env.vault_shares(self.token_id) * percent // 100
+        supply_before = self.env.vault_total_supply(self.token_id)
+        shares_before = self.env.vault_shares(self.token_id)
+        burn = shares_before * percent // 100
         sold_assets = (
             self.env.holder_assets(self.token_id, config.WRAPPER_USER_ADDRESS) * percent // 100
         )
-        quote = self.env.alpha_to_tao_quote(self.netuid, sold_assets)
-        min_tao_out = min_tao_out_for(quote)
+        min_tao_out = min_tao_out_for(self.env.alpha_to_tao_quote(self.netuid, sold_assets))
         balance_before = self.env.user_tao_wei()
         receipt = self.env.vault_send(
             2_500_000, f"{label}: TAO exit failed",
@@ -89,15 +88,28 @@ class ChurnLedger:
         )
         assert_gas_within(receipt, config.UNWRAP_GAS_BOUND, f"{label}: TAO exit")
         balance_after = self.env.user_tao_wei()
-        assert_payout_near_quote(
-            balance_before, balance_after, receipt, quote,
+        alpha_sold = assert_payout_near_quote(
+            balance_before, balance_after, receipt, self.netuid, None,
             f"{label}: TAO exit payout off quote",
         )
         assert_payout_matches_emitted(
             balance_before, balance_after, receipt,
             f"{label}: TAO exit paid less than it reported",
         )
-        self.sold_alpha_total += total_before - self.env.vault_total_stake(self.token_id)
+        # The payout is priced from the exit's own report of what it sold, so hold that
+        # report to what the shares that actually burned (net of any refund) were worth
+        # of the backing the exit found: what it left behind plus what it says it sold.
+        exit_block = chain.receipt_block_number(receipt, label)
+        burned = shares_before - self.env.vault_shares(self.token_id, block=exit_block)
+        backing = self.env.vault_total_stake(self.token_id, block=exit_block) + alpha_sold
+        entitled = burned * backing // supply_before
+        # The refund rounds to whole shares, so allow one share's worth of alpha on top of dust.
+        slack = config.ROUNDING_DUST_TOTAL_RAO + (backing + supply_before - 1) // supply_before
+        assert abs(alpha_sold - entitled) <= slack, (
+            f"{label}: TAO exit sold {alpha_sold} alpha RAO against the {entitled} that "
+            f"{burned} burned shares were worth"
+        )
+        self.sold_alpha_total += alpha_sold
         print(f"  {label}: sold {percent}% of shares for TAO")
 
     def churn_cycle(
@@ -115,15 +127,21 @@ class ChurnLedger:
         boundary = self.floor_boundary_alpha()
         self.deposit_step(label, primary_pubkey, primary_ss58, boundary * 9 // 2)
         self.unwrap_for_alpha_step(label, 80)
-        self.deposit_step(label, secondary_pubkey, secondary_ss58, boundary * 5 // 2)
+        # Before rotating, Basic can only wrap under the current primary.
+        deposit_pubkey, deposit_ss58 = (
+            (primary_pubkey, primary_ss58) if self.env.uses_basic_registry
+            else (secondary_pubkey, secondary_ss58)
+        )
+        self.deposit_step(label, deposit_pubkey, deposit_ss58, boundary * 5 // 2)
 
         replacement_pubkey, _ = bootstrap.register_hotkey(self.netuid, replacement_name)
         self.union_hotkey_pubkeys.append(replacement_pubkey)
         self.env.set_validators(
             self.netuid, [replacement_pubkey, secondary_pubkey, kept_pubkey],
-            [5000, 3000, 2000],
+            [5000, 3000, 2000], basic_hotkey=secondary_pubkey,
         )
-        print(f"  {label}: rotated {primary_pubkey[:18]}... out for {replacement_pubkey[:18]}...")
+        new_target = secondary_pubkey if self.env.uses_basic_registry else replacement_pubkey
+        print(f"  {label}: rotated {primary_pubkey[:18]}... out for {new_target[:18]}...")
 
         self.unwrap_for_alpha_step(f"{label} (over the rotated-out balances)", 50)
         rotated_out_leftover = self.env.stake(primary_pubkey, self.clone_coldkey, self.netuid)
@@ -141,7 +159,7 @@ class ChurnLedger:
 
 
 @pytest.mark.scenario
-def test_min_stake_liveness(env):
+def test_holders_can_exit_after_two_cycles_of_dust_and_validator_rotation(env):
     chain_min_stake = env.chain_min_stake_tao()
     print(f"  chain minimum stake = {chain_min_stake} RAO")
 
