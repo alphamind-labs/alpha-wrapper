@@ -11,10 +11,7 @@ import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 /// @notice One validator per subnet, updated immediately by an owner with two-step transfers.
 /// @dev Records ownership at submission. The vault performs staking.
 contract BasicValidatorRegistry is IValidatorRegistry, Ownable2Step {
-    struct Validator {
-        bytes32 hotkey;
-        bytes32 owner;
-    }
+    struct Validator { bytes32 hotkey; bytes32 owner; }
 
     mapping(uint256 => Validator) private _validators;
     mapping(uint256 => uint256) public override nonces;
@@ -27,9 +24,7 @@ contract BasicValidatorRegistry is IValidatorRegistry, Ownable2Step {
     constructor(address initialOwner) Ownable(initialOwner) { }
 
     /// @notice Keep an owner available to update validators and release recovered parking.
-    function renounceOwnership() public view override onlyOwner {
-        revert RenunciationDisabled();
-    }
+    function renounceOwnership() public view override onlyOwner { revert RenunciationDisabled(); }
 
     /// @notice Set the subnet's sole validator at 100% weight; there is no delay.
     /// @dev Resubmitting the same hotkey refreshes its owner and advances the nonce, allowing
@@ -40,26 +35,17 @@ contract BasicValidatorRegistry is IValidatorRegistry, Ownable2Step {
         (bool exists, bytes32 hotkeyOwner) = IStaking(STAKING_PRECOMPILE).getHotkeyOwner(hotkey);
         if (!exists) revert OwnerlessHotkey(hotkey);
 
-        _validators[netuid] = Validator(hotkey, hotkeyOwner);
-        uint256 nonce = ++nonces[netuid];
+        _validators[netuid] = Validator(hotkey, hotkeyOwner); uint256 nonce = ++nonces[netuid];
         emit ValidatorUpdated(netuid, nonce, hotkey, hotkeyOwner);
     }
 
     /// @inheritdoc IValidatorRegistry
-    function getValidators(uint256 netuid)
-        external
-        view
-        override
-        returns (bytes32[] memory hotkeys, uint16[] memory weights, bytes32[] memory owners)
-    {
+    function getValidators(uint256 netuid) external view override
+        returns (bytes32[] memory hotkeys, uint16[] memory weights, bytes32[] memory owners) {
         Validator memory validator = _validators[netuid];
         if (validator.hotkey == bytes32(0)) return (hotkeys, weights, owners);
 
-        hotkeys = new bytes32[](1);
-        weights = new uint16[](1);
-        owners = new bytes32[](1);
-        hotkeys[0] = validator.hotkey;
-        weights[0] = VaultMath.BPS_BASE;
-        owners[0] = validator.owner;
+        hotkeys = new bytes32[](1); weights = new uint16[](1); owners = new bytes32[](1);
+        hotkeys[0] = validator.hotkey; weights[0] = VaultMath.BPS_BASE; owners[0] = validator.owner;
     }
 }

@@ -15,9 +15,7 @@ library StakeOps {
     }
 
     /// @dev The only exposed minimum is for unstakes; using it for transfers/moves is conservative.
-    function minStakeTao() internal view returns (uint256) {
-        return IStaking(STAKING_PRECOMPILE).getDefaultMinStake();
-    }
+    function minStakeTao() internal view returns (uint256) { return IStaking(STAKING_PRECOMPILE).getDefaultMinStake(); }
 
     function hasOwner(bytes32 hotkey) internal view returns (bool exists) {
         (exists,) = IStaking(STAKING_PRECOMPILE).getHotkeyOwner(hotkey);
@@ -54,8 +52,6 @@ library StakeOps {
     /// @dev Use where refusing a movable amount would be worse than attempting it: rejects only an amount
     ///      below the floor even at the upper bound hidden by price rounding.
     function isBelowFloorAtAnyPrice(uint256 alphaAmount, uint256 alphaPriceE18) internal view returns (bool) {
-        return
-            alphaPriceE18 != 0
-                && taoValue(alphaAmount, alphaPriceE18 + VaultMath.ALPHA_PRICE_QUANTUM_E18) < minStakeTao();
+        return alphaPriceE18 != 0 && taoValue(alphaAmount, alphaPriceE18 + VaultMath.ALPHA_PRICE_QUANTUM_E18) < minStakeTao();
     }
 }

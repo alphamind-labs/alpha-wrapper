@@ -3,21 +3,11 @@ pragma solidity 0.8.36;
 
 /// @dev Coldkeys are Substrate public keys, not H160 addresses. Stake amounts and TAO thresholds use RAO.
 interface IStaking {
-    function transferStake(
-        bytes32 destination_coldkey,
-        bytes32 hotkey,
-        uint256 origin_netuid,
-        uint256 destination_netuid,
-        uint256 amount
-    ) external payable;
+    function transferStake(bytes32 destination_coldkey, bytes32 hotkey, uint256 origin_netuid,
+        uint256 destination_netuid, uint256 amount) external payable;
 
-    function moveStake(
-        bytes32 origin_hotkey,
-        bytes32 destination_hotkey,
-        uint256 origin_netuid,
-        uint256 destination_netuid,
-        uint256 amount
-    ) external payable;
+    function moveStake(bytes32 origin_hotkey, bytes32 destination_hotkey, uint256 origin_netuid,
+        uint256 destination_netuid, uint256 amount) external payable;
 
     function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid) external view returns (uint256);
 
@@ -39,9 +29,7 @@ interface IStaking {
 
     /// @notice The coldkey's conviction lock on a subnet, rolled forward to the current block.
     /// @dev A same-subnet transfer carries locked mass along once the sender's unlocked alpha is spent.
-    function getColdkeyLock(bytes32 coldkey, uint256 netuid)
-        external
-        view
+    function getColdkeyLock(bytes32 coldkey, uint256 netuid) external view
         returns (bool exists, bytes32 hotkey, uint256 lockedAlpha, uint128 conviction, bool perpetual);
 
     /// @notice Whether the coldkey refuses incoming locked alpha; the chain default is to refuse.

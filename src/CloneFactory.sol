@@ -10,21 +10,15 @@ import { IAlphaVaultAbi } from "./interfaces/IAlphaVaultAbi.sol";
 ///      verifies that protection before publishing its address.
 contract CloneFactory {
     address public immutable vault;
-    address public immutable mailboxLogic;
-    address public immutable subnetLogic;
+    address public immutable mailboxLogic; address public immutable subnetLogic;
 
     error NotVault();
 
     constructor(address _mailboxLogic, address _subnetLogic) {
-        vault = msg.sender;
-        mailboxLogic = _mailboxLogic;
-        subnetLogic = _subnetLogic;
+        vault = msg.sender; mailboxLogic = _mailboxLogic; subnetLogic = _subnetLogic;
     }
 
-    modifier onlyVault() {
-        if (msg.sender != vault) revert NotVault();
-        _;
-    }
+    modifier onlyVault() { if (msg.sender != vault) revert NotVault(); _; }
 
     /// @dev The caller's UID picks the candidate address, so a poisoned one is retried with a fresh UID.
     function deployMailbox(address user, uint16 netuid, bytes32 uid) external onlyVault returns (address) {
@@ -45,8 +39,7 @@ contract CloneFactory {
         // Plain unlocked alpha and TAO gifts do not give their sender authority over this account.
         if (
             candidate.code.length != 0 || owned || swapped || staking.getOwnedHotkeys(coldkey).length != 0
-                || VaultReads.lockedAlphaOf(coldkey, netuid) != 0
-        ) revert IAlphaVaultAbi.CloneContaminated(candidate);
+                || VaultReads.lockedAlphaOf(coldkey, netuid) != 0) revert IAlphaVaultAbi.CloneContaminated(candidate);
         Clones.cloneDeterministic(implementation, salt);
     }
 }

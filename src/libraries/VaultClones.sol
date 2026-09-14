@@ -12,14 +12,9 @@ import { VaultReads } from "./VaultReads.sol";
 ///      depositor. Compiled into each caller.
 library VaultClones {
     /// @dev Publish an address only once its protection is verified.
-    function prepareClones(
-        CloneFactory factory,
-        mapping(uint256 => address) storage subnetClone,
-        mapping(address => mapping(uint256 => address)) storage mailboxes,
-        uint256 tokenId,
-        uint256 netuid,
-        bytes32 uid
-    ) internal returns (address mailbox, address clone) {
+    function prepareClones(CloneFactory factory, mapping(uint256 => address) storage subnetClone,
+        mapping(address => mapping(uint256 => address)) storage mailboxes, uint256 tokenId, uint256 netuid,
+        bytes32 uid) internal returns (address mailbox, address clone) {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint16 nid = uint16(netuid);
         VaultReads.requireNotDissolving(nid);

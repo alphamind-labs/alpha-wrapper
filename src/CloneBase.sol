@@ -15,31 +15,23 @@ abstract contract CloneBase {
     error UnauthorizedInitializer();
 
     /// @dev Disable initialization on the implementation; clones have fresh storage.
-    constructor() {
-        initialized = true;
-    }
+    constructor() { initialized = true; }
 
-    modifier onlyWrapper() {
-        if (msg.sender != wrapper) revert NotWrapper();
-        _;
-    }
+    modifier onlyWrapper() { if (msg.sender != wrapper) revert NotWrapper(); _; }
 
     /// @dev Owning its own account as a hotkey keeps the account unswappable even while it holds no
     ///      stake, because the chain refuses coldkey swaps into any hotkey.
     function initialize(address _wrapper) external {
         if (initialized) revert AlreadyInitialized();
         if (msg.sender != _wrapper) revert UnauthorizedInitializer();
-        wrapper = _wrapper;
-        initialized = true;
+        wrapper = _wrapper; initialized = true;
         INeuron(NEURON_PRECOMPILE)
             .tryAssociateHotkey(IAddressMapping(ADDRESS_MAPPING_PRECOMPILE).addressMapping(address(this)));
     }
 
     /// @notice Transfer staked alpha to another coldkey without changing its hotkey or subnet.
     function flush(bytes32 destinationColdkey, bytes32 hotkey, uint256 netuid, uint256 amount) external onlyWrapper {
-        if (amount > 0) {
-            IStaking(STAKING_PRECOMPILE).transferStake(destinationColdkey, hotkey, netuid, netuid, amount);
-        }
+        if (amount > 0) { IStaking(STAKING_PRECOMPILE).transferStake(destinationColdkey, hotkey, netuid, netuid, amount); }
     }
 
     /// @param amount Native TAO in EVM wei.
@@ -48,9 +40,7 @@ abstract contract CloneBase {
     }
 
     function sellAlphaForTao(bytes32 hotkey, uint256 netuid, uint256 amount) external onlyWrapper {
-        if (amount > 0) {
-            IStaking(STAKING_PRECOMPILE).removeStake(hotkey, amount, netuid);
-        }
+        if (amount > 0) { IStaking(STAKING_PRECOMPILE).removeStake(hotkey, amount, netuid); }
     }
 
     receive() external payable { }
