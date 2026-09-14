@@ -9,7 +9,7 @@ ERC-1155 shares of Bittensor staked alpha, with alpha and native-TAO exits.
 - [Hotkey swaps](docs/hotkey-swaps.md): the empty-slot issue, automatic handling
   and watcher-assisted recovery.
 - [Basic validator registry](docs/basic-validator-registry.md): one owner with two-step transfers and one target per subnet.
-- [Attester guide](docs/attester-guide.md): signed validator weights.
+- [Registry migration](docs/registry-migration.md): coverage ownership and downstream integration.
 - [Edge cases](docs/edge-cases.md): dissolution, minimums, disabled transfers and dust.
 - [Security model](docs/security-model.md): authority, liveness dependencies and loss policy.
 - [Deployment](docs/deployment.md): deploying the registry and vault set, and runtime compatibility.
@@ -31,6 +31,8 @@ ERC-1155 shares of Bittensor staked alpha, with alpha and native-TAO exits.
 
 Dependencies are git submodules:
 
+OpenZeppelin Contracts is pinned to the official stable [v5.4.0 release](https://github.com/OpenZeppelin/openzeppelin-contracts/releases/tag/v5.4.0).
+
 ```bash
 git submodule update --init --recursive
 forge build
@@ -45,11 +47,11 @@ costs vary with generated inputs and are excluded from snapshots. These tests
 use mocked precompiles: compare regressions here, but use e2e transaction
 receipts to size live-chain gas.
 
-Regenerate using CI's profile and thread count:
+Regenerate using CI's profile, fuzz seed, and thread count:
 
 ```bash
 FOUNDRY_PROFILE=ci FOUNDRY_GAS_SNAPSHOT_CHECK=false FOUNDRY_GAS_SNAPSHOT_EMIT=true \
-  forge snapshot --tolerance 1 --no-match-contract Invariant --no-match-test testFuzz --threads 4
+  forge snapshot --tolerance 1 --no-match-contract Invariant --no-match-test testFuzz --fuzz-seed 0x1 --threads 4
 ```
 
 Coverage uses a different optimization mode and can overwrite snapshots;

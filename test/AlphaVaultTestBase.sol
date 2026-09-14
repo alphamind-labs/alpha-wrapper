@@ -7,14 +7,14 @@ import { AlphaVault } from "src/AlphaVault.sol";
 import { AlphaVaultLens } from "src/AlphaVaultLens.sol";
 import { DepositMailbox } from "src/DepositMailbox.sol";
 import { SubnetClone } from "src/SubnetClone.sol";
-import { ValidatorRegistry } from "src/ValidatorRegistry.sol";
+import { MockValidatorRegistry } from "./mocks/MockValidatorRegistry.sol";
 import { VaultReads } from "src/libraries/VaultReads.sol";
 import { MockStaking, CHAIN_MIN_STAKE, CHAIN_MIN_TRANSFER, CHAIN_NOMINATOR_MIN_STAKE } from "./mocks/MockStaking.sol";
 import { MockAddressMapping } from "./mocks/MockAddressMapping.sol";
 import { MockSubnetPrecompile } from "./mocks/MockSubnetPrecompile.sol";
 import { MockAlpha } from "./mocks/MockAlpha.sol";
 import { MockNeuron } from "./mocks/MockNeuron.sol";
-import { AttestationHelper } from "./helpers/AttestationHelper.sol";
+import { RegistryTestHelper } from "./helpers/RegistryTestHelper.sol";
 import { IAlphaVaultAbi } from "src/interfaces/IAlphaVaultAbi.sol";
 import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";
 import { ADDRESS_MAPPING_PRECOMPILE } from "src/interfaces/IAddressMapping.sol";
@@ -22,12 +22,12 @@ import { ALPHA_PRECOMPILE } from "src/interfaces/IAlpha.sol";
 import { NEURON_PRECOMPILE } from "src/interfaces/INeuron.sol";
 import { SUBNET_PRECOMPILE } from "src/interfaces/ISubnet.sol";
 
-abstract contract AlphaVaultTestBase is AttestationHelper, IAlphaVaultAbi {
+abstract contract AlphaVaultTestBase is RegistryTestHelper, IAlphaVaultAbi {
     AlphaVault public vault;
     AlphaVaultLens public lens;
     DepositMailbox public mailboxLogic;
     SubnetClone public subnetLogic;
-    ValidatorRegistry public registry;
+    MockValidatorRegistry public registry;
 
     address public alice = makeAddr("alice");
     address public bob = makeAddr("bob");
@@ -37,10 +37,6 @@ abstract contract AlphaVaultTestBase is AttestationHelper, IAlphaVaultAbi {
     bytes32 public hotkey3 = keccak256("hotkey3");
     bytes32 public hotkey4 = keccak256("hotkey4");
     bytes32 public hotkey5 = keccak256("hotkey5");
-
-    uint256 internal constant SIGNER_PK_1 = 0xA11CE;
-    uint256 internal constant SIGNER_PK_2 = 0xB0B;
-    uint256[] internal signerPks;
 
     string internal constant VAULT_URI = "https://api.tao20.io/{id}.json";
     uint256 internal constant RECOVERY_WINDOW = 3 hours;
@@ -88,13 +84,7 @@ abstract contract AlphaVaultTestBase is AttestationHelper, IAlphaVaultAbi {
         mailboxLogic = new DepositMailbox();
         subnetLogic = new SubnetClone();
 
-        // vm.addr(SIGNER_PK_2) < vm.addr(SIGNER_PK_1); registry signatures must be address-sorted.
-        signerPks.push(SIGNER_PK_2);
-        signerPks.push(SIGNER_PK_1);
-        address[] memory signers = new address[](2);
-        signers[0] = vm.addr(signerPks[0]);
-        signers[1] = vm.addr(signerPks[1]);
-        registry = new ValidatorRegistry(address(this), signers, 2);
+        registry = new MockValidatorRegistry();
 
         (vault, lens) = _deployVaultAndLens(address(registry));
 
@@ -125,7 +115,8 @@ abstract contract AlphaVaultTestBase is AttestationHelper, IAlphaVaultAbi {
     }
 
     function _setValidators(uint256 netuid, bytes32[] memory hks, uint16[] memory wts) internal {
-        _submitAttestation(registry, netuid, hks, wts, signerPks);
+        _recordHotkeyOwners(hks);
+        registry.setValidators(netuid, hks, wts);
     }
 
     function _hotkeys(bytes32 a) internal pure returns (bytes32[] memory arr) {

@@ -414,7 +414,7 @@ contract MockStaking {
         if (alphaAmount > (total > locked ? total - locked : 0)) {
             _fail("MockStaking: StakeUnavailable");
         }
-        // Legacy arithmetic fixtures credit one wei per TAO RAO. Native-unit campaigns enable 1e9 below.
+        // Arithmetic fixtures credit one wei per TAO RAO. Native-unit campaigns enable 1e9 below.
         uint256 consumed = removeStakeCap != 0 && alphaAmount > removeStakeCap ? removeStakeCap : alphaAmount;
         uint256 taoOut = quoteTaoOut(consumed);
         if (alphaAmount != staked && quoteTaoOut(alphaAmount) < _chainMinStakeTao) {

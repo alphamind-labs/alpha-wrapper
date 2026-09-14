@@ -24,8 +24,9 @@ transaction ordering, and the separate alpha and TAO accounting.
   credits the caller's own mailbox.
 - `CloneFactory`: a vault-owned deployer that checks each candidate account
   before deployment.
-- `ValidatorRegistry`: 1–64 target hotkeys and basis-point weights per subnet,
-  chosen by a quorum of off-chain signers. Its admin manages signer membership.
+- `BasicValidatorRegistry`: one target hotkey per subnet at 100% weight, updated
+  by its owner. Ownership transfers require the successor to accept. The vault
+  also supports downstream weighted registries through `IValidatorRegistry`.
 
 A token id is `(registrations << 16) | netuid`, where `registrations` is the
 number of times the chain has registered that netuid. Reusing a dissolved netuid
@@ -60,10 +61,10 @@ under the coldkey that owned each attested name.
 
 Unresolved swaps need a watcher. Missing backing is parked on a hotkey the
 vault's own coldkey controls, by recovery or by a delayed write-off, and stays
-parked until the attesters publish a new set. A name claimed by a stranger is
-retired by attestation. The example, watcher steps and exit restrictions are in
+parked until the registry owner publishes an update. A name claimed by a stranger
+must be replaced with the intended validator. The example, watcher steps and exit restrictions are in
 [Hotkey swaps and recovery](hotkey-swaps.md).
 
 Start with the [user guide](user-guide.md) for transactions,
-[attester guide](attester-guide.md) for registry updates, and
+[Basic registry guide](basic-validator-registry.md) for registry updates, and
 [security model](security-model.md) for trust and loss assumptions.

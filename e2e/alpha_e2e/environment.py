@@ -56,11 +56,6 @@ class Environment:
     observation_block_start: int
     registry_block_start: int
     registry_block_end: int
-    registry_type: str
-
-    @property
-    def uses_basic_registry(self) -> bool:
-        return self.registry_type == "basic"
 
     # --- On-chain getters -----------------------------------------------------
     def subnet_hotkey_pubkeys(self, subnet_index: int) -> List[str]:
@@ -408,26 +403,8 @@ class Environment:
             private_key=private_key or config.WRAPPER_USER_PRIVATE_KEY, label=label,
         )
 
-    def set_validators(
-        self, netuid: int, hotkey_pubkeys: List[str], weights: List[int], *, basic_hotkey: Optional[str] = None,
-    ) -> None:
-        """Publish a set, with an explicit sole target for compatible Basic variants.
-
-        Reject an implicit conversion: the scenario must choose the
-        single target that preserves its rotation or recovery setup.
-        """
-        if self.uses_basic_registry:
-            if basic_hotkey is None:
-                raise ValueError("Basic scenario must explicitly select one validator")
-            if basic_hotkey not in hotkey_pubkeys:
-                raise ValueError("Basic target must belong to the requested validator set")
-            validators.set_basic_validator(self.validator_registry_address, netuid, basic_hotkey)
-            return
-        validators.set_validators(
-            self.validator_registry_address,
-            [config.DEPLOYER_PRIVATE_KEY, config.WRAPPER_USER_PRIVATE_KEY],
-            netuid, hotkey_pubkeys, weights,
-        )
+    def set_validator(self, netuid: int, hotkey: str) -> None:
+        validators.set_basic_validator(self.validator_registry_address, netuid, hotkey)
 
     def crash_price_until_below(
         self, netuid: int, hotkey_pubkey: str, hotkey_ss58: str,

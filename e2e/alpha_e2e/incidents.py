@@ -68,7 +68,7 @@ def park(env: Environment, token_id: int, stranding: Stranding, context: str) ->
     assert parked >= backing_before - config.CONSOLIDATION_ROUNDING_TOLERANCE_RAO, (
         f"{context}: the parking hotkey holds {parked} against {backing_before} before the incident"
     )
-    assert env.awaiting_attestation(token_id), f"{context}: the position should wait for the attesters"
+    assert env.awaiting_attestation(token_id), f"{context}: the position should wait for the registry owner"
     assert env.backing_intact(token_id), f"{context}: parked backing accounts for itself"
     assert env.frozen_until(token_id) == 0, f"{context}: nothing should be on file any more"
     return parked

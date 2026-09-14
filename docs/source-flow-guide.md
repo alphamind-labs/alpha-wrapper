@@ -10,7 +10,7 @@ User's stake -> personal DepositMailbox -> shared SubnetClone
                                               +-> alpha delegated to hotkeys
                                               +-> native TAO balance
 
-AlphaVault: shares and accounting     ValidatorRegistry: target keys and weights
+AlphaVault: shares and accounting     IValidatorRegistry: target keys and weights
 ```
 
 ## Why there are several kinds of key
@@ -35,7 +35,7 @@ Missing backing -> syncBacking secures located backing -> fixed recovery window
                        +-> full coverage + sync -> collect returns; recovery complete; parked
                        +-> expiry + sync -> collect returns; write off deficit; parked
 
-Parked -> newer registry attestation -> next wrap/rebalance/alpha exit can
+Parked -> newer registry update -> next wrap/rebalance/alpha exit can
                                        apply the set and clear parked state
 Parked -> live alpha or TAO exit leaves no shares -> parked state cleared
 ```
@@ -47,7 +47,7 @@ other move failures still revert. One pooled obligation replaces validator-speci
 expectations during recovery; partial finds never extend the deadline. Time alone
 never finalizes a write-off. Attestations do not move stake.
 
-Parking blocks deposits and rebalancing until a newer attestation. Exits can use
+Parking blocks deposits and rebalancing until a newer registry update. Exits can use
 parked backing, subject to execution checks. Transfers and accrued TAO claims
 remain separate. Dissolution takes another path: exits wait through applicable
 cleanup, then old shares redeem the clone's unreserved TAO.

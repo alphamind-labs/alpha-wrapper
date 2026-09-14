@@ -6,14 +6,9 @@ import { IValidatorRegistry } from "./interfaces/IValidatorRegistry.sol";
 import { VaultMath } from "./libraries/VaultMath.sol";
 import { VaultReads } from "./libraries/VaultReads.sol";
 import {
-    NetuidOutOfRange,
-    LockedBacking,
-    NoSharesOutstanding,
-    Parked,
-    SharePriceBelowPrecision,
-    ShortfallOnFile,
-    SubnetDissolved,
-    ZeroAddress
+    NetuidOutOfRange, LockedBacking, NoSharesOutstanding,
+    Parked, SharePriceBelowPrecision, ShortfallOnFile,
+    SubnetDissolved, ZeroAddress
 } from "./VaultErrors.sol";
 
 /// @dev Quotes share the vault's math, but do not guarantee a call will execute.
@@ -36,8 +31,7 @@ contract AlphaVaultLens {
 
     constructor(AlphaVault _vault) {
         if (address(_vault) == address(0)) revert ZeroAddress();
-        vault = _vault;
-        validatorRegistry = _vault.validatorRegistry();
+        vault = _vault; validatorRegistry = _vault.validatorRegistry();
     }
 
     /// @dev Rejects missing backing and a loss on file, as the vault's priced operations do, except
@@ -48,18 +42,14 @@ contract AlphaVaultLens {
     }
 
     /// @notice Located alpha, including when a shortfall makes `totalStake` revert.
-    function locatedStake(uint256 tokenId) external view returns (uint256) {
-        return _readBacking(tokenId).backing.total;
-    }
+    function locatedStake(uint256 tokenId) external view returns (uint256) { return _readBacking(tokenId).backing.total; }
 
     /// @notice Unlocated alpha relative to the recorded obligation.
     /// @dev Dust at recorded keys reduces this amount, even if it cannot be parked and is later written off.
     function missingStake(uint256 tokenId) external view returns (uint256) {
         BackingRead memory read = _readBacking(tokenId);
         uint256 expected;
-        for (uint256 i; i < read.slots.length; ++i) {
-            expected += read.slots[i].tracked;
-        }
+        for (uint256 i; i < read.slots.length; ++i) { expected += read.slots[i].tracked; }
         return expected > read.backing.total ? expected - read.backing.total : 0;
     }
 
@@ -69,8 +59,7 @@ contract AlphaVaultLens {
         address clone = vault.subnetClone(tokenId);
         if (clone == address(0)) return backing;
         return VaultReads.resolveBacking(
-            vault.recordedSlots(tokenId), VaultReads.coldkeyOf(clone), VaultMath.netuidOf(tokenId)
-        );
+            vault.recordedSlots(tokenId), VaultReads.coldkeyOf(clone), VaultMath.netuidOf(tokenId));
     }
 
     /// @notice Recorded active keys, before resolving any new swap.
@@ -99,21 +88,17 @@ contract AlphaVaultLens {
     /// @notice Whether deposits and weight alignment await an attestation newer than the parking one.
     /// @dev Alpha can rest on the parking hotkey after this turns false, until the next wrap, rebalance or alpha
     ///      exit moves it.
-    function awaitingAttestation(uint256 tokenId) external view returns (bool) {
-        return vault.awaitingAttestation(tokenId);
-    }
+    function awaitingAttestation(uint256 tokenId) external view returns (bool) { return vault.awaitingAttestation(tokenId); }
 
     function _readBacking(uint256 tokenId) private view returns (BackingRead memory read) {
-        read.netuid = VaultMath.netuidOf(tokenId);
-        read.clone = vault.subnetClone(tokenId);
+        read.netuid = VaultMath.netuidOf(tokenId); read.clone = vault.subnetClone(tokenId);
         if (read.clone == address(0)) return read;
         _locateBacking(read, tokenId, VaultReads.isDissolvingOrDissolved(tokenId));
     }
 
     /// @dev Dissolution converts alpha to TAO; do not treat that drain as missing backing.
     function _locateBacking(BackingRead memory read, uint256 tokenId, bool alphaInFlux) private view {
-        read.coldkey = VaultReads.coldkeyOf(read.clone);
-        read.alphaInFlux = alphaInFlux;
+        read.coldkey = VaultReads.coldkeyOf(read.clone); read.alphaInFlux = alphaInFlux;
         if (alphaInFlux) {
             bytes32[] memory keys = VaultReads.activesOf(vault.recordedSlots(tokenId));
             read.backing.total = VaultMath.sumBalances(VaultReads.fetchBalances(keys, read.coldkey, read.netuid));
@@ -162,8 +147,7 @@ contract AlphaVaultLens {
     function previewUnwrap(uint256 tokenId, uint256 shares) external view returns (uint256 alpha, uint256 tao) {
         if (shares == 0) return (0, 0);
         BackingRead memory read;
-        read.netuid = VaultMath.netuidOf(tokenId);
-        read.clone = vault.subnetClone(tokenId);
+        read.netuid = VaultMath.netuidOf(tokenId); read.clone = vault.subnetClone(tokenId);
         if (read.clone == address(0)) return (0, 0);
         uint256 supply = vault.totalSupply(tokenId);
         if (supply == 0) return (0, 0);
@@ -187,15 +171,9 @@ contract AlphaVaultLens {
         return _claimableTaoOf(account, tokenId);
     }
 
-    function batchClaimableTaoOf(address account, uint256[] calldata tokenIds)
-        external
-        view
-        returns (uint256[] memory amounts)
-    {
+    function batchClaimableTaoOf(address account, uint256[] calldata tokenIds) external view returns (uint256[] memory amounts) {
         amounts = new uint256[](tokenIds.length);
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            amounts[i] = _claimableTaoOf(account, tokenIds[i]);
-        }
+        for (uint256 i = 0; i < tokenIds.length; i++) { amounts[i] = _claimableTaoOf(account, tokenIds[i]); }
     }
 
     function _claimableTaoOf(address account, uint256 tokenId) private view returns (uint256) {
@@ -213,9 +191,7 @@ contract AlphaVaultLens {
         return VaultReads.resolveValidators(validatorRegistry, uint16(netuid)).hotkeys;
     }
 
-    function _shortSince(uint256 tokenId) private view returns (uint64 shortSince) {
-        (shortSince,) = vault.recovery(tokenId);
-    }
+    function _shortSince(uint256 tokenId) private view returns (uint64 shortSince) { (shortSince,) = vault.recovery(tokenId); }
 
     function _requireCurrentRegistration(uint256 tokenId) private view {
         if (VaultReads.isDissolved(tokenId)) revert SubnetDissolved();
@@ -231,7 +207,6 @@ contract AlphaVaultLens {
 
     function _pendingAt(address account, uint256 tokenId, uint256 index) private view returns (uint256) {
         return VaultMath.pendingTao(
-            VaultMath.earnedAt(vault.balanceOf(account, tokenId), index), vault.taoIndexDebt(tokenId, account)
-        );
+            VaultMath.earnedAt(vault.balanceOf(account, tokenId), index), vault.taoIndexDebt(tokenId, account));
     }
 }

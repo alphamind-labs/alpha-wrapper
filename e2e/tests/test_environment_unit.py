@@ -1,7 +1,7 @@
 """Chainless tests for the harness's position arithmetic and record parsing."""
 import pytest
 
-from alpha_e2e import chain, config, environment, validators
+from alpha_e2e import chain, environment, validators
 from alpha_e2e.environment import Environment, largest_burn_leaving_alpha
 
 VIRTUAL_SHARES = 10**9
@@ -47,38 +47,10 @@ def test_recorded_slot_index_reads_the_active_key_of_each_slot(monkeypatch):
     assert env.recorded_slot_index(7, active_a) == 0
 
 
-def _environment(registry_type):
-    env = Environment.__new__(Environment)
-    env.registry_type = registry_type
-    env.validator_registry_address = "registry"
-    return env
-
-
-@pytest.mark.parametrize("hotkeys, weights", [(["A", "B"], [5000, 5000]), (["A"], [9999]), (["A"], [10000]), ([], [])])
-def test_basic_update_rejects_implicit_conversion(hotkeys, weights):
-    with pytest.raises(ValueError, match="explicitly select"):
-        _environment("basic").set_validators(7, hotkeys, weights)
-
-
-def test_basic_update_rejects_a_target_outside_the_requested_set():
-    with pytest.raises(ValueError, match="must belong"):
-        _environment("basic").set_validators(7, ["A"], [10000], basic_hotkey="B")
-
-
-def test_basic_update_submits_only_the_selected_hotkey(monkeypatch):
+def test_validator_update_submits_the_selected_hotkey(monkeypatch):
     calls = []
     monkeypatch.setattr(validators, "set_basic_validator", lambda *args: calls.append(args))
-    def refuse_attestation(*args, **kwargs):
-        raise AssertionError("Basic must not sign an attestation")
-    monkeypatch.setattr(validators, "set_validators", refuse_attestation)
-    env = _environment("basic")
-    env.set_validators(7, ["A", "B"], [5000, 5000], basic_hotkey="B")
+    env = Environment.__new__(Environment)
+    env.validator_registry_address = "registry"
+    env.set_validator(7, "B")
     assert calls == [("registry", 7, "B")]
-
-
-def test_attested_update_preserves_the_whole_set(monkeypatch):
-    calls = []
-    monkeypatch.setattr(validators, "set_validators", lambda *args: calls.append(args))
-    _environment("attested").set_validators(7, ["A", "B"], [5000, 5000], basic_hotkey="B")
-    assert calls == [("registry", [config.DEPLOYER_PRIVATE_KEY, config.WRAPPER_USER_PRIVATE_KEY],
-                      7, ["A", "B"], [5000, 5000])]

@@ -3,16 +3,14 @@
 ## Authority and trust
 
 The vault has no admin or upgrade path. Only it can drive its mailbox and subnet
-clones. Validator authority depends on the registry selected at deployment:
+clones. `BasicValidatorRegistry` has one owner choosing a single hotkey per subnet
+at 100% weight. OpenZeppelin two-step ownership transfers require the nominated
+successor to accept; the existing owner retains authority until then. Renunciation
+is disabled. Downstream registries may supply different governance and weighted
+sets through `IValidatorRegistry`; TAO20's attested registry is maintained there.
 
-- `ValidatorRegistry`: quorum signers choose validator weights; its admin manages
-  signers and admins.
-- `BasicValidatorRegistry`: one owner chooses a single hotkey per subnet at 100%
-  weight. OpenZeppelin two-step ownership transfers require the nominated successor
-  to accept; the existing owner retains authority until then. Renunciation is disabled.
-
-Neither registry's administrators nor signers can directly withdraw backing,
-mint/burn users' shares, access their mailboxes or change vault code.
+The registry owner cannot directly withdraw backing, mint/burn users' shares,
+access their mailboxes or change vault code.
 
 A Basic owner can rotate its key while it still has access, or nominate a successor
 who can later accept independently. If the owner key is lost with no accessible
@@ -36,7 +34,7 @@ Holders rely on:
 - Registry governance and validator performance.
 - A funded, responsive watcher to repair unresolved swaps and park backing, and
   a registry authority that publishes a new set to release a parked position
-  (quorum attesters or the Basic owner). Watcher calls are permissionless; publishing
+  (the Basic owner here). Watcher calls are permissionless; publishing
   requires that registry's authorization. Neither has an on-chain completion guarantee.
 - Trusted vault/lens builds and addresses. The lens's `vault()` checks pairing,
   not authenticity; mid-operation callback quotes may observe unfinished state.
@@ -133,7 +131,7 @@ from this ordering is bounded by `H`: it reallocates the late recovery, rather
 than also extracting another `H` from located backing. Emissions or surplus on
 the hidden key can make the later windfall exceed the `BackingWrittenOff` amount.
 Deposits stay shut between the write-off and the next registry update, so the
-quorum attesters or Basic owner decide when step 3 becomes possible.
+Basic owner decides when step 3 becomes possible.
 
 This is accepted policy and a reason to park before write-off. Afterward,
 neither `recoverStray` nor a new registry update reconstructs the old holders' claims.
@@ -154,7 +152,6 @@ them; accrued TAO survives either way.
 - A parked position earns no emissions until the registry authority publishes a new set.
   Any validator in the set can force a parking event by renaming its key and
   cutting the trail.
-- In `ValidatorRegistry`, signatures have no expiry; landing a replacement retires a competing old list.
 - Clone protection relies on the chain refusing coldkey swaps into existing
   hotkeys and rejecting locked-alpha transfers by default. A public UID can be
   front-run into a retry; a poisoned candidate never becomes backing.

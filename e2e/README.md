@@ -28,42 +28,39 @@ Use one scenario module per fresh chain. Modules share subnet and contract state
 through the session-scoped `env` fixture; running several against one long-lived
 chain is unsupported. CI gives each scenario its own container.
 
-## Registry variants
+## Registry and scenario ownership
 
-The default remains `ValidatorRegistry`. CI also runs each compatible scenario in a
-separate job and fresh chain with `--registry-type basic`, deploying
-`BasicValidatorRegistry` with the deployer as initial owner. Pytest gives the cases
-separate `[attested]` and `[basic]` IDs. To select the Basic full flow:
+Every scenario deploys the real `BasicValidatorRegistry` with the deployer as its
+initial owner and uses real Subtensor precompiles. There is no mock registry or
+registry selector in e2e. All 13 scenario modules run on separate fresh localnets.
 
-```bash
-python3 -m pytest tests/test_full_flow.py -v -m scenario --registry-type basic
-```
+Bootstrap registers and funds three candidate hotkeys per subnet, then configures
+only the first as the sole target. Deposits use the currently configured hotkey.
+Rotations and parking releases call `setValidator` from the registry owner.
+The full flow covers both exits, emissions, observability and rotation; churn
+rotates A to B and B to C. The minimum-stake case retains its deposit gate and
+rotated-dust consolidation legs.
 
-Both modes register and fund three hotkeys per subnet. Basic initially configures
-only the first as its 100% target, and deposits must use that currently listed key:
-`wrap` rejects deposits under unlisted keys. Rotations and parking releases explicitly
-choose a sole successor; they submit owner transactions without signing attestations.
-The full flow covers deposits under the configured target, observability, both exit
-rails, emissions and a real rotation from the sole incumbent to another hotkey.
-Basic churn rotates A to B and then B to C, depositing under the current target in
-each phase. The min-stake-floor Basic case covers its deposit gate and
-rotated-dust consolidation legs; its third leg specifically tests a weighted split
-and is inapplicable to one 100% target.
+Five scenarios require simultaneous weighted validators and now run in
+[TAO20's attested e2e suite](https://github.com/alphamind-labs/tao20-contract/tree/main/e2e/tests/attested_vault).
+Their generic Solidity coverage remains here with a controllable registry mock.
 
-These scenarios remain attested-only:
-
-| Scenario | Why its setup cannot be reproduced with a single recorded validator |
+| Scenario | Why Basic cannot reproduce it |
 | --- | --- |
-| `test_concurrent_swap_recovery.py` | Requires simultaneous unequal balances on multiple recorded hotkeys, then independent swaps before any vault synchronization. |
-| `test_shared_recovery_deadline.py` | Requires A and E to disappear while C remains located, then partial recovery of A while E stays missing. |
-| `test_recovery_dust.py` | Requires multiple independently lost slots and a third case with one still-located slot to seed movable parking. |
-| `test_hostile_dust.py` | Requires a recorded 50/30/20 set with A/B funded and C at zero after a skipped corrective move, then a foreign donation on C and its rotation out. A never-recorded foreign key is not the same case. |
-| `test_dust_exit.py` | Requires a refused-dust slot to remain recorded alongside live backing at 9999/1 weights; a Basic rotation consolidates the old slot on the next wrap. |
+| `test_concurrent_swap_recovery.py` | Multiple unequal recorded balances disappear independently before synchronization. |
+| `test_shared_recovery_deadline.py` | Two slots disappear while another remains located, followed by partial recovery. |
+| `test_recovery_dust.py` | Multiple lost sources and a still-located slot are needed to seed movable parking. |
+| `test_hostile_dust.py` | Foreign alpha lands on an empty but recorded third weighted slot before its rotation out. |
+| `test_dust_exit.py` | A refused slot stays recorded beside live backing at 9999/1 weights; Basic would consolidate it. |
+
+The weighted-rebalance leg of `test_min_stake_floor.py` also remains in TAO20;
+one 100% target cannot develop a weight imbalance. See the full
+[coverage inventory](../docs/registry-migration.md).
 
 ## Layout and coverage
 
 `alpha_e2e/` contains configuration, address derivation, chain commands,
-extrinsics, validator signatures, checks, environment actions and bootstrap.
+extrinsics, Basic updates, checks, environment actions and bootstrap.
 `conftest.py` switches to the repository root and registers the fixture;
 `pytest.ini` configures imports and the `scenario` marker. `chain_ops.py` is the
 manual CLI for the same chain operations.
@@ -79,26 +76,15 @@ Scenario files in `tests/` cover:
 - `test_subnet_dissolved.py`: refunds and mailbox recovery.
 - `test_min_stake_floor.py`, `test_dust_dos.py`, `test_min_stake_liveness.py`:
   minimums, top-ups, dust and repeated position changes.
-- `test_hostile_dust.py`: third-party stake donations.
 - `test_claimable_tao.py`: forced-sale proceeds and holder entitlements.
 - `test_parked_stake.py`: a funded hotkey left without an owner; partial exits wait
-  for the attesters to replace the name, then the vault claims the key itself.
+  for the owner to replace the name, then the vault claims the key itself.
 - `test_parked_recovery.py`: a stranger cuts the trail behind a rename; the watcher
-  parks the position, exits pay from the parking hotkey, a new attestation releases.
-- `test_concurrent_swap_recovery.py`: two unequal swaps precede recovery; supplying
-  only the larger balance cannot change the record, and joint recovery permits a full exit.
-- `test_shared_recovery_deadline.py`: a second loss seen at the old deadline gets
-  a full new window before write-off. Uses a three-minute constructor window and
-  real chain timestamps, including when the first balance returns before expiry.
+  parks the position, exits pay from the parking hotkey, an owner update releases.
 - `test_parking_isolation.py`: two subnets park on the one parking hotkey; each keeps
-  its own balance, the other keeps trading, and each releases on its own attestation.
+  its own balance, the other keeps trading, and each releases on its own owner update.
 - `test_subnet_generation.py`: a rewritten registration block leaves the token and its
   exits untouched; dissolving and re-registering the netuid yields a new token.
-- `test_dust_exit.py`: on a pool deepened to where most subnets trade, a leftover the
-  pool refuses to quote makes the plain TAO exit burn its gas; the exit that excludes
-  that slot pays partial and full exits from live backing on a hotkey outside the
-  metagraph, which no emissions touch.
-
 Each module's docstring describes its sequence. These scenarios exercise specific
 recovery conditions, not an unconditional exit guarantee; see the
 [design](../docs/hotkey-swaps.md).

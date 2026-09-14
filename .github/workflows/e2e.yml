@@ -18,14 +18,13 @@ env:
 
 jobs:
   e2e:
-    name: Localnet E2E (${{ matrix.registry }}, ${{ matrix.scenario }})
+    name: Localnet E2E (${{ matrix.scenario }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     strategy:
       fail-fast: false
       matrix:
-        registry: [attested, basic]
         # Each scenario gets its own fresh subtensor service container, so the
         # transfers-off run (which globally disables alpha transfers) is isolated.
         scenario:
@@ -36,39 +35,16 @@ jobs:
           - tests/test_subnet_dissolved.py
           - tests/test_min_stake_floor.py
           - tests/test_dust_dos.py
-          - tests/test_hostile_dust.py
           - tests/test_min_stake_liveness.py
           - tests/test_claimable_tao.py
           - tests/test_parked_stake.py
           - tests/test_parked_recovery.py
-          - tests/test_concurrent_swap_recovery.py
-          - tests/test_shared_recovery_deadline.py
-          - tests/test_recovery_dust.py
           - tests/test_parking_isolation.py
           - tests/test_subnet_generation.py
-          - tests/test_dust_exit.py
-
-        # These scenarios require multiple simultaneous recorded validators.
-        # See e2e/README.md for the per-scenario explanation.
-        exclude:
-          - registry: basic
-            scenario: tests/test_concurrent_swap_recovery.py
-          - registry: basic
-            scenario: tests/test_shared_recovery_deadline.py
-          - registry: basic
-            scenario: tests/test_recovery_dust.py
-          - registry: basic
-            scenario: tests/test_hostile_dust.py
-          - registry: basic
-            scenario: tests/test_dust_exit.py
 
     services:
       subtensor:
-        # The opentensor namespace is frozen at spec 424: the dissolution legs need the
-        # RaoFoundation package (431+ for isSubnetDissolving) and the vault's chain-read
-        # min stake needs 438+ for getDefaultMinStake.
-        # Pinned by digest: devnet is a moving target; bump deliberately.
-        image: ghcr.io/raofoundation/subtensor-localnet:devnet@sha256:f68b9a1744401fca244a25ec579f461926944c6addac252a89af88a9e9271510
+        image: ghcr.io/raofoundation/subtensor-localnet:main@sha256:c3bd611f395fe31f72fde964d8e0b99a2c7221c5508eec7d61bbafaba0374dc5
         ports:
           - 9944:9944
           - 9945:9945
@@ -124,7 +100,7 @@ jobs:
         # pipefail so a failing run still fails the step through the tee.
         run: |
           set -o pipefail
-          python -m pytest ${{ matrix.scenario }} -v -s -m scenario --registry-type ${{ matrix.registry }} --tb=short | tee /tmp/e2e.log
+          python -m pytest ${{ matrix.scenario }} -v -s -m scenario --tb=short | tee /tmp/e2e.log
 
       - name: Report on-chain gas per call
         if: always()
@@ -132,7 +108,7 @@ jobs:
         run: |
           if grep -q 'GAS |' /tmp/e2e.log; then
             {
-              echo "## On-chain gas: ${{ matrix.registry }} / ${{ matrix.scenario }}"
+              echo "## On-chain gas: ${{ matrix.scenario }}"
               echo '```'
               grep 'GAS |' /tmp/e2e.log | sed 's/^ *GAS | *//'
               echo '```'
