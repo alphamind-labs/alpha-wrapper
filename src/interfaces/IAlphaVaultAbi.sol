@@ -42,6 +42,6 @@ interface IAlphaVaultAbi {
     error DepositTooSmall();
     error CloneProtectionFailed(address clone);
     error CloneContaminated(address candidate);
-    /// @dev Two attested entries would share one backing key; attesters must resolve the collision.
+    /// @dev Two attested entries would share one backing key; a registry update must resolve the collision.
     error SwappedHotkeyStillAttested();
 }

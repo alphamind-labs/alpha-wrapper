@@ -9,7 +9,7 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @notice One validator per subnet, updated immediately by an owner with two-step transfers.
-/// @dev Records ownership at submission, just like ValidatorRegistry. The vault performs staking.
+/// @dev Records ownership at submission. The vault performs staking.
 contract BasicValidatorRegistry is IValidatorRegistry, Ownable2Step {
     struct Validator {
         bytes32 hotkey;

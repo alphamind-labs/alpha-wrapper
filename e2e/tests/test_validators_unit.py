@@ -19,4 +19,4 @@ def test_basic_transaction_uses_owner_and_checks_receipt(monkeypatch, status):
         with pytest.raises(validators.ValidatorUpdateError, match="setValidator failed"):
             validators.set_basic_validator("registry", 7, "A")
     assert calls == [(("registry", "setValidator(uint256,bytes32)", 7, "A"),
-                      {"private_key": config.DEPLOYER_PRIVATE_KEY, "gas_limit": 500_000})]
+                      {"private_key": config.DEPLOYER_PRIVATE_KEY, "gas_limit": 500_000, "rpc": config.RPC_URL})]

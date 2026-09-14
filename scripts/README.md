@@ -18,9 +18,9 @@ build the contracts before using them.
 `--vault-address`. Use a trusted lens: checking its `vault()` catches a mismatch,
 not fabricated quotes.
 
-`get_validator_updates.py` defaults to the attested registry. Pass
-`--registry-type basic` to decode `BasicValidatorRegistry.ValidatorUpdated` events.
-The CSV schema is the same, with `count` equal to one.
+`get_validator_updates.py` decodes `BasicValidatorRegistry.ValidatorUpdated` events,
+with `count` equal to one. `get_vault_state.py` reads optional validator columns
+through the generic `IValidatorRegistry` ABI.
 
 Units: `_rao` columns are alpha at 9 decimals; `_wei` columns are native TAO at
 18 decimals. Shares are raw ERC-1155 units. Alpha payouts, alpha requested for sale

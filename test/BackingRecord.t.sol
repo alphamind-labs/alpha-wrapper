@@ -2,7 +2,7 @@
 pragma solidity 0.8.36;
 
 import { VaultMath } from "src/libraries/VaultMath.sol";
-import { MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { MAX_VALIDATORS } from "src/interfaces/IValidatorRegistry.sol";
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { VaultReads } from "src/libraries/VaultReads.sol";
 import { AttestedHotkeyRetired, ZeroAmount } from "src/VaultErrors.sol";

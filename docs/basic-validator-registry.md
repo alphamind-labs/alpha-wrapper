@@ -17,8 +17,7 @@ There are no signers, attestations, batch updates or timelocks. Validator update
 take effect immediately.
 
 Updates reject zero hotkeys, netuids above 65,535 and hotkeys without an owner record
-in the staking precompile. Like `ValidatorRegistry`, this contract records the owner
-at update time, without requiring subnet membership. It uses the precompile's owner
+in the staking precompile. This contract records the owner at update time, without requiring subnet membership. It uses the precompile's owner
 existence flag; a stored zero AccountId is not the absence of an owner record.
 
 Unconfigured subnets return three empty arrays and nonce zero. Each successful update
@@ -29,8 +28,23 @@ recovered parking after an owner decision. Configured subnets cannot be cleared.
 Owner changes on-chain do not silently change the recorded owner; the vault retains
 its existing ownership checks and recovery behavior.
 
-For update history, use `scripts/get_validator_updates.py --registry-type basic`
+For update history, use `scripts/get_validator_updates.py`
 with the usual registry address, RPC and block-range arguments. The shared getters
 used by `get_vault_state.py` need no special mode.
 
 E2E compatibility is documented in [the e2e guide](../e2e/README.md).
+
+A rotation is applied on the next wrap, alpha exit or `rebalance(netuid)`; those
+operations consolidate backing from the dropped target. TAO exits sell existing
+backing without applying registry weights. Deposits under a dropped hotkey remain
+in the depositor's mailbox until reclaimed or the registry lists that key again.
+
+After recovery, `awaitingAttestation` remains the vault's ABI name for waiting on a
+new registry nonce. Publish the intended validator to release parking. Check its
+current owner first: refreshing a name captured by a stranger authorizes that
+stranger's coldkey. A validator coldkey swap likewise needs an explicit refresh.
+
+A registry update cannot account for missing backing. Coordinate recovery before
+write-off where possible; a funded successor added after write-off benefits the
+current holders when settlement adopts it. See the
+[late-recovery risk](security-model.md#recovery-window-tradeoff-and-late-recovery-attack).

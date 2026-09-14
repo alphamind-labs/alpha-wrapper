@@ -3,7 +3,7 @@ pragma solidity 0.8.36;
 
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { CHAIN_MIN_STAKE } from "./mocks/MockStaking.sol";
-import { MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { MAX_VALIDATORS } from "src/interfaces/IValidatorRegistry.sol";
 
 contract DynamicValidatorSetTest is AlphaVaultTestBase {
     /// @dev The dropped balance clears the move floor, but dividing it across 63 deficits does not.

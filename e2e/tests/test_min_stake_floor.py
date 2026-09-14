@@ -1,17 +1,7 @@
-"""Scenario: min-stake floor handling.
-
-Tests that the vault respects the chain's minimum-stake rule without ever costing
-users money: a deposit below the minimum is refused cheaply and goes through once
-topped up; leftovers stranded by a validator change are picked up by the next
-deposit; an internal move too small for the chain is skipped rather than attempted
-and failed, and a later, larger deposit corrects the imbalance.
-
-The legs run in order inside one test: leg 1's healthy first wrap anchors the gas
-baseline leg 3's budget is measured against.
-"""
+"""Sub-floor deposits require a top-up; a later deposit consolidates dust from a rotated-out validator."""
 import pytest
 
-from alpha_e2e import bootstrap, chain, config, extrinsics
+from alpha_e2e import config, extrinsics
 from alpha_e2e.checks import assert_gas_within
 from alpha_e2e.substrate import h160_to_ss58
 
@@ -62,18 +52,11 @@ def test_min_stake_floor(env):
     extrinsics.transfer_stake(
         h160_to_ss58(gate_mailbox), gate_hotkey_ss58, gate_netuid, sub_floor_alpha,
     )
-    above_floor_wrap_receipt = env.vault_send(
+    env.vault_send(
         1_500_000, "Floor gate: above-floor wrap failed",
         "wrap(uint256,bytes32,uint256)", gate_netuid, gate_hotkey_pubkey, 0,
     )
     print("  wrap accepted the deposit once it cleared the minimum")
-
-    # A healthy first wrap - clone deploy, flush, skipped sub-floor moves - anchors leg 3.
-    wrap_gas_baseline = chain.receipt_gas_used(above_floor_wrap_receipt)
-    assert wrap_gas_baseline is not None, (
-        "Floor gate: could not parse gasUsed for the wrap baseline"
-    )
-    print(f"  Healthy first-wrap gas baseline: {wrap_gas_baseline}")
 
     # --- Leg 2: rotated-out dust is consolidated by the next wrap ------------------
     # The next wrap's fresh deposit starts the roller, so deposit and dust roll over the
@@ -84,16 +67,8 @@ def test_min_stake_floor(env):
     dust_hotkey_ss58 = env.hotkey_ss58s[6]
     kept_hotkey_b_pubkey = env.hotkey_pubkeys[7]
     kept_hotkey_b_ss58 = env.hotkey_ss58s[7]
-    kept_hotkey_c_pubkey = env.hotkey_pubkeys[8]
 
-    rotated_in_pubkey, _ = bootstrap.register_hotkey(dust_netuid, "hk_e2e_3d")
-    print(f"  Registered replacement validator {rotated_in_pubkey[:18]}... "
-          f"on netuid {dust_netuid}")
-
-    # The bootstrap's 50/30/20 set is already attested, with the dust hotkey first.
     dust_price, dust_boundary = env.floor_boundary(dust_netuid, chain_min_stake)
-    # 1.5x the boundary clears the deposit floor while every corrective move stays below
-    # it, keeping the whole deposit on the dust hotkey.
     dust_deposit = dust_boundary * 3 // 2
     env.deposit_and_wrap(
         dust_netuid, dust_hotkey_pubkey, dust_hotkey_ss58, dust_deposit,
@@ -117,10 +92,7 @@ def test_min_stake_floor(env):
     print(f"  Left sub-floor dust of {dust_residue} alpha RAO under the "
           "soon-rotated hotkey")
 
-    env.set_validators(
-        dust_netuid, [rotated_in_pubkey, kept_hotkey_b_pubkey, kept_hotkey_c_pubkey],
-        [5000, 3000, 2000], basic_hotkey=kept_hotkey_b_pubkey,
-    )
+    env.set_validator(dust_netuid, kept_hotkey_b_pubkey)
     dust_total_before = env.vault_total_stake(dust_token_id)
     consolidating_deposit = dust_boundary * 3
     env.deposit_and_wrap(
@@ -148,65 +120,3 @@ def test_min_stake_floor(env):
     )
     print("  Backing folded in the fresh deposit and the reclaimed dust; "
           "remembered set refreshed to the current set")
-
-    if env.uses_basic_registry:
-        # A single 100% target has no weighted split to drift or correct. The
-        # Basic variant covers the deposit gate and rotated-dust consolidation above.
-        return
-
-    # --- Leg 3: a sub-floor rebalance move is skipped, not attempted ----------------
-    # The vault applies the same readable minimum to corrective moves, so it skips them and leaves
-    # the split drifted rather than forwarding a call it cannot prove will land - a rejected
-    # dispatch would consume the whole forwarded gas budget. The zero balances below are what
-    # prove the skip; the gas bound only shows nothing was forwarded and burned.
-    skip_netuid = env.netuids[1]
-    skip_token_id = env.token_ids[1]
-    over_hotkey_pubkey = env.hotkey_pubkeys[3]
-    over_hotkey_ss58 = env.hotkey_ss58s[3]
-    under_hotkey_b_pubkey = env.hotkey_pubkeys[4]
-    under_hotkey_c_pubkey = env.hotkey_pubkeys[5]
-    env.set_validators(
-        skip_netuid, [over_hotkey_pubkey, under_hotkey_b_pubkey, under_hotkey_c_pubkey],
-        [5000, 3000, 2000],
-    )
-
-    _, skip_boundary = env.floor_boundary(skip_netuid, chain_min_stake)
-    # 1.5x the boundary clears the deposit floor while the corrective moves (0.45x and
-    # 0.3x) stay below it.
-    skip_deposit = skip_boundary * 3 // 2
-    skip_wrap_receipt = env.deposit_and_wrap(
-        skip_netuid, over_hotkey_pubkey, over_hotkey_ss58, skip_deposit, 1_500_000,
-        "Sub-floor skip: wrap with sub-floor residue failed (doomed move attempted?)",
-    )
-    skip_gas_used = chain.receipt_gas_used(skip_wrap_receipt)
-    assert skip_gas_used is not None, "Sub-floor skip: could not parse gasUsed"
-
-    skip_clone_coldkey = env.clone_coldkey(skip_token_id)
-    under_b_stake = env.stake(under_hotkey_b_pubkey, skip_clone_coldkey, skip_netuid)
-    under_c_stake = env.stake(under_hotkey_c_pubkey, skip_clone_coldkey, skip_netuid)
-    assert under_b_stake == 0 and under_c_stake == 0, (
-        f"Sub-floor skip: a sub-floor move was executed "
-        f"({under_b_stake} / {under_c_stake} RAO moved)"
-    )
-    # Baseline-derived bound tracks chain-side gas re-pricing; a doomed move burns
-    # far past +25%.
-    skip_gas_bound = wrap_gas_baseline * 5 // 4
-    assert skip_gas_used <= skip_gas_bound, (
-        f"Sub-floor skip: wrap consumed {skip_gas_used} gas (bound {skip_gas_bound}; "
-        "doomed move burned the budget)"
-    )
-    print(f"  Sub-floor moves skipped: wrap used {skip_gas_used} gas "
-          f"(bound {skip_gas_bound}), split left drifted")
-
-    env.deposit_and_wrap(
-        skip_netuid, over_hotkey_pubkey, over_hotkey_ss58, skip_boundary * 6,
-        1_500_000, "Sub-floor skip: follow-up wrap failed",
-    )
-    under_b_stake = env.stake(under_hotkey_b_pubkey, skip_clone_coldkey, skip_netuid)
-    under_c_stake = env.stake(under_hotkey_c_pubkey, skip_clone_coldkey, skip_netuid)
-    assert under_b_stake != 0 and under_c_stake != 0, (
-        f"Sub-floor skip: drift did not clear on the follow-up deposit "
-        f"({under_b_stake} / {under_c_stake} RAO)"
-    )
-    print(f"  Follow-up deposit cleared the drift: {under_b_stake} and {under_c_stake} RAO "
-          "on the under-validators")

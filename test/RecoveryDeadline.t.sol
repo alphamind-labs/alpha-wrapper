@@ -2,7 +2,7 @@
 pragma solidity 0.8.36;
 
 import { VaultMath } from "src/libraries/VaultMath.sol";
-import { MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { MAX_VALIDATORS } from "src/interfaces/IValidatorRegistry.sol";
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { BackingNotSecured, BackingUnchanged, NothingToRecover, ShortfallOnFile } from "src/VaultErrors.sol";
 import { STAKING_PRECOMPILE } from "src/interfaces/IStaking.sol";

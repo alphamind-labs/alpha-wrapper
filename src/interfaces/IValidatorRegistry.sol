@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.36;
 
+uint256 constant MAX_VALIDATORS = 64;
+
 interface IValidatorRegistry {
     /// @dev Empty means unconfigured. Otherwise 1..64 distinct nonzero hotkeys with matching nonzero
     ///      BPS weights summing to 10000, and the coldkey that owned each hotkey when the set landed.

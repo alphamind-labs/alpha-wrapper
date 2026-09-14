@@ -2,7 +2,7 @@
 pragma solidity 0.8.36;
 
 import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
-import { MAX_VALIDATORS } from "src/ValidatorRegistry.sol";
+import { MAX_VALIDATORS } from "src/interfaces/IValidatorRegistry.sol";
 
 // Mock-based regression measurements, not live-chain gas estimates; use e2e receipts for sizing.
 

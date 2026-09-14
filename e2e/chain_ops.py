@@ -17,7 +17,7 @@ Subcommands:
     remove_stake            sell staked alpha back to the pool for TAO, as //Alice
     lock_stake              conviction-lock alpha to a hotkey, as //Alice
     get_lock                print a (coldkey, netuid, hotkey) lock's alpha amount
-    set_validators          submit a signed validator-set update to the registry
+    set_validator           update the Basic registry from its owner
     toggle_transfer         flip a subnet's alpha transfer toggle via Sudo
     set_admin_freeze_window set the global admin freeze window via Sudo
     dissolve_network        dissolve (deregister) a subnet via Sudo
@@ -110,14 +110,12 @@ def main() -> None:
     p.add_argument("--chain-endpoint", required=True)
     p.add_argument("--netuid", required=True, type=int)
 
-    p = sub.add_parser("set_validators")
+    p = sub.add_parser("set_validator")
     p.add_argument("--rpc-url", required=True)
     p.add_argument("--registry", required=True)
-    p.add_argument("--signer-pk", required=True, action="append", dest="signer_pks",
-                   help="Repeat for each signer. First listed pays the transaction.")
+    p.add_argument("--owner-pk", required=True)
     p.add_argument("--netuid", required=True, type=int)
-    p.add_argument("--hotkeys", required=True, help="Comma-separated bytes32 hex hotkeys")
-    p.add_argument("--weights", required=True, help="Comma-separated BPS weights summing to 10000")
+    p.add_argument("--hotkey", required=True, help="Sole validator's bytes32 hex hotkey")
 
     args = parser.parse_args()
 
@@ -172,18 +170,16 @@ def main() -> None:
                 args.netuid, chain_endpoint=args.chain_endpoint,
             )
         ))
-    elif args.cmd == "set_validators":
+    elif args.cmd == "set_validator":
         try:
-            transaction_hash = validators.set_validators(
-                args.registry, args.signer_pks, args.netuid,
-                args.hotkeys.split(","),
-                [int(weight) for weight in args.weights.split(",")],
-                rpc_url=args.rpc_url,
+            transaction_hash = validators.set_basic_validator(
+                args.registry, args.netuid, args.hotkey,
+                private_key=args.owner_pk, rpc=args.rpc_url,
             )
         except validators.ValidatorUpdateError as error:
             print(f"FAIL: {error}", file=sys.stderr)
             sys.exit(1)
-        print(f"ok netuid={args.netuid} signers={len(args.signer_pks)} tx={transaction_hash}")
+        print(f"ok netuid={args.netuid} tx={transaction_hash}")
 
 
 if __name__ == "__main__":

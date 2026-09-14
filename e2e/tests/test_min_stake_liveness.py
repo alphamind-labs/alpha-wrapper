@@ -8,7 +8,7 @@ the Foundry accounting campaign separately checks exact conservation.
 """
 import pytest
 
-from alpha_e2e import bootstrap, chain, config
+from alpha_e2e import chain, config
 from alpha_e2e.checks import (
     assert_gas_within, assert_payout_matches_emitted, assert_payout_near_quote, min_tao_out_for,
 )
@@ -116,32 +116,17 @@ class ChurnLedger:
         self, round_number: int,
         primary_pubkey: str, primary_ss58: str,
         secondary_pubkey: str, secondary_ss58: str,
-        kept_pubkey: str, replacement_name: str,
-    ) -> str:
-        """Deposit, withdraw most of it, deposit again, rotate the primary validator
-        out for a fresh one, withdraw across the rotated-out balances, deposit, and sell
-        a slice for TAO. Returns the replacement hotkey's pubkey."""
+    ) -> None:
         label = f"Cycle {round_number}"
         print(f"\n=== Churn cycle {round_number} ===")
 
         boundary = self.floor_boundary_alpha()
         self.deposit_step(label, primary_pubkey, primary_ss58, boundary * 9 // 2)
         self.unwrap_for_alpha_step(label, 80)
-        # Before rotating, Basic can only wrap under the current primary.
-        deposit_pubkey, deposit_ss58 = (
-            (primary_pubkey, primary_ss58) if self.env.uses_basic_registry
-            else (secondary_pubkey, secondary_ss58)
-        )
-        self.deposit_step(label, deposit_pubkey, deposit_ss58, boundary * 5 // 2)
+        self.deposit_step(label, primary_pubkey, primary_ss58, boundary * 5 // 2)
 
-        replacement_pubkey, _ = bootstrap.register_hotkey(self.netuid, replacement_name)
-        self.union_hotkey_pubkeys.append(replacement_pubkey)
-        self.env.set_validators(
-            self.netuid, [replacement_pubkey, secondary_pubkey, kept_pubkey],
-            [5000, 3000, 2000], basic_hotkey=secondary_pubkey,
-        )
-        new_target = secondary_pubkey if self.env.uses_basic_registry else replacement_pubkey
-        print(f"  {label}: rotated {primary_pubkey[:18]}... out for {new_target[:18]}...")
+        self.env.set_validator(self.netuid, secondary_pubkey)
+        print(f"  {label}: rotated {primary_pubkey[:18]}... out for {secondary_pubkey[:18]}...")
 
         self.unwrap_for_alpha_step(f"{label} (over the rotated-out balances)", 50)
         rotated_out_leftover = self.env.stake(primary_pubkey, self.clone_coldkey, self.netuid)
@@ -155,7 +140,6 @@ class ChurnLedger:
 
         self.deposit_step(label, secondary_pubkey, secondary_ss58, boundary * 3)
         self.unwrap_for_tao_step(label, 40)
-        return replacement_pubkey
 
 
 @pytest.mark.scenario
@@ -183,13 +167,11 @@ def test_holders_can_exit_after_two_cycles_of_dust_and_validator_rotation(env):
         ledger.floor_boundary_alpha() * 3 // 2,
     )
 
-    cycle1_replacement_pubkey = ledger.churn_cycle(
+    ledger.churn_cycle(
         1, hotkey_a_pubkey, hotkey_a_ss58, hotkey_b_pubkey, hotkey_b_ss58,
-        hotkey_c_pubkey, "hk_e2e_1d",
     )
     ledger.churn_cycle(
         2, hotkey_b_pubkey, hotkey_b_ss58, hotkey_c_pubkey, hotkey_c_ss58,
-        cycle1_replacement_pubkey, "hk_e2e_1e",
     )
 
     # --- Full exit and closing ledger ------------------------------------------------

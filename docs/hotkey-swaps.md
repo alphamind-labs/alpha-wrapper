@@ -1,5 +1,9 @@
 # Hotkey swaps and recovery
 
+The vault supports weighted `IValidatorRegistry` implementations. Here, registry
+updates come from the Basic owner and select one target; TAO20 maintains the
+attested implementation. ABI names such as `awaitingAttestation` remain unchanged.
+
 The design uses automatic one-hop swap handling plus an external watcher.
 Temporary wrap/exit failures while the watcher repairs chain state are accepted.
 It does not promise every holder an immediate exit under every chain condition.
@@ -49,13 +53,13 @@ receiving key is usable only under that coldkey: the attested name itself, the
 recorded active key, or its one-hop successor, whichever the attested owner
 holds. A validator's own rename keeps its coldkey, so its successor qualifies. A
 vacated name claimed by anyone else reports `AttestedHotkeyRetired` and receives
-nothing; the attesters retire it by publishing a set without it.
+nothing; the registry owner retires it by replacing the target.
 
 The chain refuses to move stake through a hotkey with no owner record. When the
 vault has to move stake off such a key, it claims the key for its own coldkey
 first, then moves. That claim serves the move and is permanent; it does not
 make the key an attested destination. A validator's coldkey swap changes the
-owner of its hotkeys, and the attesters confirm the new owner by publishing
+owner of its hotkeys, and the registry owner confirms the new owner by publishing
 again.
 
 ## The parking hotkey
@@ -77,7 +81,7 @@ is then parked:
 One parking hotkey serves every subnet. The chain keys stake by hotkey, coldkey
 and subnet, and each subnet's position rests under its own clone coldkey, so
 parking one subnet moves nothing of another's and each position is released by
-its own attesters.
+its own registry authority.
 
 The first wrap, rebalance or alpha exit after a newer attestation rolls the
 parked alpha onto the attested set, aligns it and clears the parked state.
@@ -88,7 +92,7 @@ name was already replaced or never mattered.
 
 | Problem | Meaning | Repair |
 | --- | --- | --- |
-| Name answers to the wrong coldkey | The attested name, its recorded key and its successor are all unusable. | Attesters publish a set without the name, or the attested owner reclaims it. |
+| Name answers to the wrong coldkey | The attested name, its recorded key and its successor are all unusable. | Registry governance publishes a set without the name, or the attested owner reclaims it. |
 | Missing backing | The vault cannot locate enough alpha to satisfy its record. | Park it with `recoverStray`, or let `syncBacking` write off the difference after the window. |
 
 They can occur together. `isBackingIntact() == true` does not prove an exit can
@@ -116,7 +120,7 @@ any shortfall or recovery clock.
    After collecting full coverage, call sync again to finalize recovery.
    Full recovery or write-off leaves the position parked. Alpha recovered later
    belongs to the holders at that time.
-5. After completion, attesters publish a newer set even if all backing returned.
+5. After completion, registry governance publishes a newer set even if all backing returned.
    Remove any lost or captured name, naming the intended successor. The next wrap
    or `rebalance(netuid)` releases the parked position onto it.
 
@@ -147,12 +151,12 @@ quotes until the position parks or the loss is written off. Share transfers,
 claimable TAO and mailbox recovery do not depend on that backing check.
 
 A parked position pays exits but takes no deposits and earns nothing until the
-attesters publish again. Any validator in the set can force a parking event by
+registry governance publishes again. Any validator in the set can force a parking event by
 renaming its key and cutting the trail; the cost to holders is emissions until
 the next attestation lands.
 
 A revert preserves shares and stake, but costs gas. A finalized write-off really
 reduces holders' accounted backing; alpha recovered later belongs to holders at
-recovery time. Watcher and attester availability are therefore liveness
+recovery time. Watcher and registry authority availability are therefore liveness
 dependencies, and recovery before write-off matters financially. See the
 [late-recovery risk](security-model.md#recovery-window-tradeoff-and-late-recovery-attack).

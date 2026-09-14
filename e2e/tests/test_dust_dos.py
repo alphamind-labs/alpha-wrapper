@@ -16,7 +16,7 @@ subnets):
 """
 import pytest
 
-from alpha_e2e import bootstrap, chain, config
+from alpha_e2e import chain, config
 from alpha_e2e.checks import (
     assert_gas_within, assert_payout_matches_emitted, assert_payout_near_quote, min_tao_out_for,
 )
@@ -34,16 +34,8 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     rotated_out_hotkey_ss58 = env.hotkey_ss58s[0]
     kept_hotkey_b_pubkey = env.hotkey_pubkeys[1]
     kept_hotkey_b_ss58 = env.hotkey_ss58s[1]
-    kept_hotkey_c_pubkey = env.hotkey_pubkeys[2]
-
-    # A fresh validator to take the dust hotkey's slot after the rotation.
-    replacement_pubkey, _ = bootstrap.register_hotkey(netuid, "hk_e2e_1d")
-    print(f"  Registered replacement validator {replacement_pubkey[:18]}... on netuid {netuid}")
 
     _, floor_boundary_alpha = env.floor_boundary(netuid, chain_min_stake)
-    # 1.5x the boundary clears the deposit floor while every corrective move toward
-    # the 50/30/20 split stays below it, keeping the whole deposit on the
-    # soon-rotated hotkey.
     initial_deposit = floor_boundary_alpha * 3 // 2
     env.deposit_and_wrap(
         netuid, rotated_out_hotkey_pubkey, rotated_out_hotkey_ss58, initial_deposit,
@@ -63,10 +55,7 @@ def test_rotated_out_dust_cannot_lock_the_vault(env):
     assert env.alpha_value_tao(netuid, dust_residue) < chain_min_stake, (
         f"Rotated-out dust: residual {dust_residue} alpha RAO is not sub-floor"
     )
-    env.set_validators(
-        netuid, [replacement_pubkey, kept_hotkey_b_pubkey, kept_hotkey_c_pubkey],
-        [5000, 3000, 2000], basic_hotkey=kept_hotkey_b_pubkey,
-    )
+    env.set_validator(netuid, kept_hotkey_b_pubkey)
     print(f"  Position is now {dust_residue} alpha RAO of dust under a rotated-out hotkey")
 
     remaining_shares = env.vault_shares(token_id)
@@ -236,9 +225,6 @@ def test_sub_floor_co_holder_cannot_be_locked_in_or_leak_the_other_holder(env):
     print("  Funded holder 2 with 10 TAO for gas")
 
     _, floor_boundary_alpha = env.floor_boundary(netuid, chain_min_stake)
-    # The large holder's corrective moves (3x and 2x the boundary) land, so the
-    # position carries a real 50/30/20 split; the small holder sits just above
-    # the floor.
     large_deposit = floor_boundary_alpha * 10
     small_deposit = floor_boundary_alpha * 12 // 10
     env.deposit_and_wrap(

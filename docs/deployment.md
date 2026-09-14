@@ -1,31 +1,29 @@
-# Deployment and runtime compatibility
+# Deployment
 
-## Order of operations
-
-1. Deploy `ValidatorRegistry` with its admin, initial signers and threshold.
-2. Have the signers publish a first validator set for every subnet in scope.
+1. Deploy `BasicValidatorRegistry` with its initial owner.
+2. The owner calls `setValidator(netuid, hotkey)` for every subnet in scope.
 3. Deploy the vault set with `script/DeployAlpha.s.sol`, pointed at that registry.
 4. Run the verification checks below, then record the addresses and code hashes.
 
 ## Registry
 
-`ValidatorRegistry(admin, initialSigners, threshold)`:
-
-- `admin` holds `DEFAULT_ADMIN_ROLE` and rotates the signer list and threshold
-  later with `setSigners`.
-- `initialSigners` are EVM addresses: at least 2, at most 16, distinct and
-  nonzero.
-- `threshold` is at least 2 and at most the number of signers.
+`BasicValidatorRegistry(initialOwner)` assigns each subnet one validator at 100%
+weight. Updates take effect immediately. Ownership transfers use OpenZeppelin
+`Ownable2Step`; renunciation is disabled.
 
 ```sh
-forge create src/ValidatorRegistry.sol:ValidatorRegistry \
+forge create src/BasicValidatorRegistry.sol:BasicValidatorRegistry \
   --rpc-url <url> --private-key <key> --broadcast \
-  --constructor-args <admin> "[<signer1>,<signer2>]" 2
+  --constructor-args <initialOwner>
+
+cast send <registry> 'setValidator(uint256,bytes32)' <netuid> <hotkey> \
+  --rpc-url <url> --private-key <owner-key>
 ```
 
-A quorum then signs one attestation per subnet and anyone submits it with
-`updateValidators`, with the signatures sorted by signer address ascending. The
-[attester guide](attester-guide.md) covers the payload, domain and nonce rules.
+The hotkey must have an owner record. See the
+[Basic registry guide](basic-validator-registry.md) for rotation, owner snapshots
+and parking release. Other `IValidatorRegistry` implementations can be supplied
+by downstream projects; TAO20 owns its `AttestedValidatorRegistry`.
 
 ## Vault set
 

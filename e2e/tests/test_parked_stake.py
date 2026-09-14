@@ -1,9 +1,9 @@
-"""A funded hotkey loses its owner; the attesters replace the name and the vault claims the key.
+"""A funded hotkey loses its owner; the owner replaces the name and the vault claims the key.
 
 A validator moves its identity to a new hotkey while its stake stays behind. The old
 hotkey then has no owner record, so the chain would refuse to move alpha off it, and
 the attested name no longer answers to the coldkey that was attested. The vault keeps
-the position quotable but refuses partial exits until the attesters publish a set that
+the position quotable but refuses partial exits until the owner publishes a set that
 names the successor. The next exit then claims the abandoned key for the vault's own
 coldkey, rolls the stake onto the successor and pays the holder, with no watcher and
 no subnet re-registration involved.
@@ -14,7 +14,7 @@ from alpha_e2e import config, extrinsics, substrate
 
 
 @pytest.mark.scenario
-def test_holder_exits_after_attesters_replace_the_ownerless_name(env):
+def test_holder_exits_after_owner_replaces_the_ownerless_name(env):
     netuid = env.netuids[0]
     token_id = env.token_ids[0]
     hotkeys = env.subnet_hotkey_pubkeys(0)
@@ -61,9 +61,8 @@ def test_holder_exits_after_attesters_replace_the_ownerless_name(env):
         "unwrap(uint256,uint256,bytes32,uint256)", token_id, exit_shares, env.wrapper_substrate_coldkey, 1,
     )
 
-    # The attesters name the successor in place of the abandoned key.
-    env.set_validators(netuid, [successor_pubkey, hotkeys[1], hotkeys[2]], [5000, 3000, 2000],
-                       basic_hotkey=successor_pubkey)
+    # The owner names the successor in place of the abandoned key.
+    env.set_validator(netuid, successor_pubkey)
 
     # The same exit, now paid: the vault claims the abandoned key, rolls the stake onto the
     # successor and delivers to the holder's own coldkey.
@@ -72,7 +71,7 @@ def test_holder_exits_after_attesters_replace_the_ownerless_name(env):
     delivery_keys = hotkeys + [successor_pubkey]
     delivered_before = env.total_stake_across(env.wrapper_substrate_coldkey, netuid, delivery_keys)
     env.vault_send(
-        4_000_000, "Parked: the exit should succeed once the attesters replaced the name",
+        4_000_000, "Parked: the exit should succeed once the owner replacesd the name",
         "unwrap(uint256,uint256,bytes32,uint256)", token_id, exit_shares, env.wrapper_substrate_coldkey, 1,
         label="unwrap [claims the abandoned key]",
     )
