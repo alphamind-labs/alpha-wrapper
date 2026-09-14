@@ -37,6 +37,7 @@ interface IAlphaVaultAbi {
     event BackingParked(uint256 indexed tokenId, uint256 backing, uint256 registryNonce);
     event BackingRecovered(uint256 indexed tokenId, bytes32 indexed hotkey, uint256 amount);
 
+    error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value);
     error ConsolidationBelowFloor();
     error GatherBelowFloor();
     error DepositTooSmall();

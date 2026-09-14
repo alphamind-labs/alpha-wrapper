@@ -1069,6 +1069,21 @@ contract UnwrapForTaoTest is AlphaVaultTestBase {
         assertEq(_getVaultStake(hotkey2, NETUID1), 0, "exact-fit slot drained via the exemption");
     }
 
+    function test_FullDrainThenPartialSale_UsesUpdatedBalances() public {
+        _setRemoveStakeRate(1, 1);
+        _depositForAlice(100 * ALPHA);
+        uint256 total = _plantVaultStakes(NETUID1, 10 * ALPHA, 50 * ALPHA, 0);
+        uint256 shares = _sharesForExactAssets(TOKEN1, 30 * ALPHA, total);
+
+        uint256 balanceBefore = alice.balance;
+        vm.prank(alice);
+        vault.unwrapForTao(TOKEN1, shares, 0);
+
+        assertEq(alice.balance - balanceBefore, 30 * ALPHA, "full drain plus partial sale pays the entitlement");
+        assertEq(_getVaultStake(hotkey1, NETUID1), 0, "first slot stays drained");
+        assertEq(_getVaultStake(hotkey2, NETUID1), 30 * ALPHA, "only the outstanding entitlement is sold");
+    }
+
     function test_PartialSellBelowSpotFloor_NeverReachesSimSwap() public {
         _setRemoveStakeRate(1, 1);
         _depositForAlice(100 * ALPHA);

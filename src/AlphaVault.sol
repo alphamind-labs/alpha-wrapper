@@ -5,8 +5,6 @@ import { ERC1155 } from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import { ERC1155Supply } from "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155Supply.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { CloneFactory } from "./CloneFactory.sol";
-import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
-import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { SubnetClone } from "./SubnetClone.sol";
 import { DepositMailbox } from "./DepositMailbox.sol";
 import { IStaking, STAKING_PRECOMPILE } from "./interfaces/IStaking.sol";
@@ -260,10 +258,7 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard, IAlphaVaultAbi {
         _burn(msg.sender, tokenId, shares);
 
         uint256 balanceBefore = clone.balance;
-        uint256 dustThresholdTao = IStaking(STAKING_PRECOMPILE).getNominatorMinRequiredStake();
-        // Full drains precede partials so a shrunken partial cannot consume a later floor-exempt drain.
-        uint256 remaining = _sellRound(clone, netuid, hotkeys, balances, excludedSlots, assets, dustThresholdTao, false);
-        _sellRound(clone, netuid, hotkeys, balances, excludedSlots, remaining, dustThresholdTao, true);
+        VaultAllocation.sellForTao(clone, netuid, hotkeys, balances, excludedSlots, assets);
 
         uint256 taoOut = clone.balance - balanceBefore;
         if (taoOut == 0) revert WithdrawTooSmall();
@@ -480,71 +475,6 @@ contract AlphaVault is ERC1155, ERC1155Supply, ReentrancyGuard, IAlphaVaultAbi {
             netuid: VaultMath.netuidOf(tokenId),
             alphaPriceE18: alphaPriceE18
         });
-    }
-
-    function _sellRound(
-        address clone,
-        uint16 netuid,
-        bytes32[] memory hotkeys,
-        uint256[] memory balances,
-        uint256 excludedSlots,
-        uint256 remaining,
-        uint256 dustThresholdTao,
-        bool includePartials
-    ) private returns (uint256) {
-        for (uint256 i; i < hotkeys.length && remaining != 0;) {
-            uint256 balance = (excludedSlots >> i) & 1 == 0 ? balances[i] : 0;
-            uint256 chunk;
-            if (balance <= remaining) {
-                chunk = balance;
-            } else if (includePartials) {
-                chunk = _sellableChunk(netuid, remaining, balance, dustThresholdTao);
-            }
-            if (chunk != 0) {
-                StakeOps.sell(clone, hotkeys[i], netuid, chunk);
-                balances[i] = balance - chunk;
-                remaining -= chunk;
-            }
-            unchecked {
-                ++i;
-            }
-        }
-        return remaining;
-    }
-
-    /// @dev Partial sales must clear the post-fee minimum without leaving dust the chain would force-sell
-    ///      into this caller's payout at the remaining holders' expense.
-    ///      The chain reports a slot balance as a 64-bit amount, so narrowing one for a quote cannot
-    ///      truncate; a wider value is a fixture rather than a position and is refused.
-    function _sellableChunk(uint16 netuid, uint256 remaining, uint256 balance, uint256 dustThresholdTao)
-        private
-        view
-        returns (uint256)
-    {
-        uint256 alphaPriceE18 = IAlpha(ALPHA_PRECOMPILE).getAlphaPrice(netuid);
-        if (alphaPriceE18 == 0) return 0;
-
-        // One extra RAO covers the leftover quote's rounding.
-        uint256 minLeftover = dustThresholdTao == 0
-            ? 0
-            : Math.ceilDiv((dustThresholdTao + 1) * VaultMath.ALPHA_PRICE_SCALE, alphaPriceE18);
-        if (balance <= minLeftover) return 0;
-
-        uint256 maxChunk = balance - minLeftover;
-        uint256 chunk = maxChunk < remaining ? maxChunk : remaining;
-        // Keep gas-consuming simulation failures away from provably sub-floor inputs.
-        if (StakeOps.isBelowFloorAtReadPrice(chunk, alphaPriceE18)) return 0;
-
-        uint256 chunkQuote = IAlpha(ALPHA_PRECOMPILE).simSwapAlphaForTao(netuid, SafeCast.toUint64(chunk));
-        if (chunkQuote < StakeOps.minStakeTao()) return 0;
-
-        // The marginal quote bounds leftover value at the post-sale price.
-        if (dustThresholdTao != 0) {
-            uint256 leftoverQuote =
-                IAlpha(ALPHA_PRECOMPILE).simSwapAlphaForTao(netuid, SafeCast.toUint64(balance)) - chunkQuote;
-            if (leftoverQuote < dustThresholdTao) return 0;
-        }
-        return chunk;
     }
 
     function _holdsRotatedOutStake(VaultReads.Backing memory backing, bytes32[] memory currentSet)
