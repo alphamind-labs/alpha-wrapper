@@ -56,8 +56,3 @@ FOUNDRY_PROFILE=ci FOUNDRY_GAS_SNAPSHOT_CHECK=false FOUNDRY_GAS_SNAPSHOT_EMIT=tr
 
 Coverage uses a different optimization mode and can overwrite snapshots;
 regenerate them with the command above before committing.
-
-## License
-
-Alpha Wrapper is licensed under the [MIT License](LICENSE).
-Third-party dependencies retain their respective licenses.
