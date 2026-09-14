@@ -5,7 +5,6 @@ import { AlphaVaultTestBase } from "./AlphaVaultTestBase.sol";
 import { ClaimBelowNativePrecision, SupplyCapExceeded, ZeroAddress, ZeroAmount } from "src/VaultErrors.sol";
 import { ClaimDuringTransferReceiver, RevertingReceiver, ClaimReentrantReceiver } from "./helpers/TaoRailReceivers.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 
 contract ClaimableTaoTest is AlphaVaultTestBase {
     uint256 internal constant DEPOSIT = 30 ether;
@@ -172,7 +171,7 @@ contract ClaimableTaoTest is AlphaVaultTestBase {
         uint256 liability = vault.taoLiability(TOKEN1);
         uint256 cloneBalance = vault.subnetClone(TOKEN1).balance;
 
-        vm.expectRevert(Address.FailedInnerCall.selector);
+        vm.expectRevert(bytes("nope"));
         vm.prank(alice);
         vault.claimTao(TOKEN1, payable(address(receiver)));
 
